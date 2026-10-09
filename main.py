@@ -132,7 +132,7 @@ class MyPlugin(Star):
 
     @filter.command("flower", alias={'花配方'})
     async def flower(self, event: AstrMessageEvent):
-        """查询花配方：/花配方 花名，或 /花配方 品类 品质（如：/花配方 百合 蓝）"""
+        """查询花配方：/花配方 花名 或品类（品类列出整类配方），也可 /花配方 品类 品质（如：/花配方 百合 蓝）"""
         target = FLOWER_CMD_PREFIX.sub("", event.message_str).strip()
         text = self._render(await self._build_flower_reply(target))
         yield event.plain_result(text)
@@ -236,41 +236,59 @@ class MyPlugin(Star):
         return "\n".join(lines)
 
     async def _build_flower_reply(self, target: str) -> str:
-        """把花配方查询结果整理成要回复的纯文本。"""
+        """把花配方查询结果整理成要回复的纯文本。
+
+        /花配方 的三种查法（输入都支持模糊匹配，直接取最相似项）：
+        1. 品类（/花配方 百合）→ 列出整类配方
+        2. 具体花名（/花配方 紫霞百合）→ 只列这一朵
+        3. 品类 + 品质（/花配方 百合 蓝）→ 只列该品质
+        """
         if not self._flower_rows:
             return "花数据没加载成功，请检查 flower.xlsx 是否放在插件目录下。"
         if not target:
-            return "请输入花名，例如：/花配方 紫霞百合\n也可以按品类+品质批量查，例如：/花配方 百合 蓝"
+            return (
+                "请输入花名或品类，例如：/花配方 紫霞百合、/花配方 百合\n"
+                "查品类会列出整类的杂交配方；也可以按品类+品质批量查，例如：/花配方 百合 蓝"
+            )
 
         parts = target.split()
-        # 「/花配方 百合 蓝」拆成两段：先模糊匹配品类（「大花马齿」→「大花马齿苋」），再列该品质的花
+        # 两根词 = 品类 + 品质（如 /花配方 百合 蓝）
         if len(parts) == 2:
-            category, quality = parts
-            cat = self._flower_category(category)
-            if cat is None:
-                return f"没有「{category}」这个品类哦"
-            hits = [
-                row
-                for row in self._flower_rows
-                if str(row[0]).strip() == cat and str(row[2]).strip() == quality
-            ]
-            if not hits:
-                return f"「{cat}」里没有 {quality} 品质的花（白/蓝/紫/金）"
-            return "\n\n".join(self._format_flower_row(row) for row in hits)
+            return self._flower_quality_reply(parts[0], parts[1])
+        # 其余 = 品类或具体花名（如 /花配方 百合、/花配方 紫霞百合）
+        return self._flower_single_reply(target)
 
-        # 单个片段：在花名（色+品类）上模糊匹配，直接取相似度最高的那朵
-        # 候选里每个花名都已含品类（如「紫霞百合」），所以输入「百合」这种品类词也能算相似度
-        target_base = base_name(target)
-        best_score, best_pos = max(
-            (
-                (SequenceMatcher(None, target_base, base).ratio(), pos)
-                for pos, base in enumerate(self._flower_base)
-            ),
-            key=lambda item: item[0],
-        )
-        if best_score < FLOWER_CUTOFF:
-            return "根本没有这种花，或者没有输入完整"
-        return self._format_flower_row(self._flower_rows[best_pos])
+    def _flower_quality_reply(self, category_text: str, quality: str) -> str:
+        """「品类 + 品质」查询：先模糊匹配品类（「大花马齿」→「大花马齿苋」），再列该品质的花。"""
+        cat = self._flower_category(category_text)
+        if cat is None:
+            return f"没有「{category_text}」这个品类哦"
+        hits = [
+            row
+            for row in self._flower_rows
+            if str(row[0]).strip() == cat and str(row[2]).strip() == quality
+        ]
+        if not hits:
+            return f"「{cat}」里没有 {quality} 品质的花（白/蓝/紫/金）"
+        return "\n\n".join(self._format_flower_row(row) for row in hits)
+
+    def _flower_single_reply(self, target: str) -> str:
+        """单段输入的查询：更像品类就列整类（「百合」），更像具体花名就查单朵（「紫霞百合」）。
+
+        为什么要比分数：花名本身含品类（「紫霞百合」里也有「百合」），
+        只看「有没有匹配到品类」会把「紫霞百合」误判成品类查询。
+        所以品类、花名各取最相似项，谁分高听谁的：
+        「百合」品类分 1.0 > 花名分（「紫霞百合」≈0.67）→ 列整类；
+        「紫霞百合」花名分 1.0 > 品类分（品类「百合」≈0.67）→ 查单朵。
+        """
+        cat_score, cat = self._flower_best_category(target)
+        flower_score, best_pos = self._flower_best_flower(target)
+
+        if cat is not None and cat_score >= FLOWER_CUTOFF and cat_score >= flower_score:
+            return self._build_flower_list(cat)
+        if flower_score >= FLOWER_CUTOFF:
+            return self._format_flower_row(self._flower_rows[best_pos])
+        return "根本没有这种花，或者没有输入完整"
 
     def _format_flower_row(self, raw_row: list) -> str:
         """把一行花数据格式化成「(品质)花名：\n父本1 ⊗/× 父本2\n→ 花名」；白品质不标品质。"""
@@ -287,16 +305,51 @@ class MyPlugin(Star):
             return f"{quality} {name}：\n{way or '还没有大佬研究出它的配方orz'}"
         return f"### {quality} {name}：\n{self._flower_process(color1, color2, category)}\n→ {self._flower_display_name(name, category)}"
 
+    def _build_flower_list(self, category: str) -> str:
+        """列出一个品类的全部杂交配方，一行一组短名：「亲本1 ⊗/× 亲本2 → 后代」。
+
+        例：百合 → 「黄 × 白 → 灿黄」「青 ⊗ 青 → 紫霞」……
+        短名 = 花名去掉品类后缀（「灿黄百合」→「灿黄」），紧凑得能一眼看完整个品类；
+        单朵详情仍用完整花名。品类里一条配方都没有（比如全是基础花）时回复一句提示。
+        """
+        lines = []
+        for raw_row in self._flower_rows:
+            row = ["" if pd.isna(cell) else cell for cell in raw_row]
+            if str(row[0]).strip() != category:
+                continue
+            color1, color2 = str(row[3]).strip(), str(row[4]).strip()
+            if not color1 or not color2:
+                continue  # 基础花没有配方；「？？？」占位行两者皆空
+            sym = self._flower_symbol(color1, color2)
+            result = self._flower_short_name(str(row[1]).strip(), category)
+            lines.append(f"{color1} {sym} {color2} → {result}")
+        if not lines:
+            return f"「{category}」还没有收集到配方"
+        return f"### {category}\n" + "\n".join(lines)
+
+    def _flower_short_name(self, name: str, category: str) -> str:
+        """显示短名：能剥掉品类后缀就剥（「紫霞百合」→「紫霞」），剥不掉就保持原名。
+
+        「紫罗兰」品类里基底花名就是品类名本身，剥不了，原样返回。
+        """
+        if name.endswith(category) and len(name) > len(category):
+            return name[: -len(category)]
+        return name
+
     def _flower_process(self, color1: str, color2: str, category: str) -> str:
         """杂交过程那一行「亲本1 ⊗/× 亲本2」，只把花色部分加粗。
 
         亲本名 = 花色 + 品类（「青」+「百合」），只加粗花色那一段 → **青**百合。
-        所有展示杂交过程的地方都走这里，保证样式一致；
+        单朵详情与 /花组合 都走这里，保证样式一致；
+        品类总览（_build_flower_list）用紧凑短名，不走这里。
         OneBot 等不渲染 Markdown 的平台，_render 会把 ** 标记去掉。
         """
-        # 两个亲本花色相同 = 自交，用 ⊗；不同则是杂交，用 ×
-        sym = "⊗" if color1 == color2 else "×"
+        sym = self._flower_symbol(color1, color2)
         return f"{self._flower_parent(color1, category)} {sym} {self._flower_parent(color2, category)}"
+
+    def _flower_symbol(self, color1: str, color2: str) -> str:
+        """杂交符号：两个亲本花色相同 = 自交，用 ⊗；不同则是杂交，用 ×。"""
+        return "⊗" if color1 == color2 else "×"
 
     def _flower_parent(self, color: str, category: str) -> str:
         """亲本名只给花色加粗：正常「青百合」→「**青**百合」；紫罗兰特例还原成「紫罗兰」不加粗。"""
@@ -357,22 +410,40 @@ class MyPlugin(Star):
             return "根本没有这种组合"
         return "\n\n".join(hits)
 
-    def _flower_category(self, text: str) -> str | None:
-        """把用户输入的品类模糊匹配到表里的品类（「大花马齿」→「大花马齿苋」）。
+    def _flower_best_flower(self, text: str) -> tuple[float, int]:
+        """在花名（色+品类，如「紫霞百合」）里找与输入最相似的一朵，返回（相似度, 表内行下标）。"""
+        target = base_name(text)
+        return max(
+            (
+                (SequenceMatcher(None, target, base).ratio(), pos)
+                for pos, base in enumerate(self._flower_base)
+            ),
+            key=lambda item: item[0],
+        )
 
-        相似度低于 FLOWER_CUTOFF 时返回 None，让调用方提示没这个品类。
+    def _flower_best_category(self, text: str) -> tuple[float, str | None]:
+        """在表内品类里找与输入最相似的一个，返回（相似度, 品类）。
+
+        相似度是原始分数、不设阈值，交给调用方按场景判断；没有品类时返回 (0.0, None)。
         """
         if not self._flower_cats:
-            return None
+            return 0.0, None
         target = base_name(text)
-        best_score, best_cat = max(
+        return max(
             (
                 (SequenceMatcher(None, target, cat).ratio(), cat)
                 for cat in self._flower_cats
             ),
             key=lambda item: item[0],
         )
-        return best_cat if best_score >= FLOWER_CUTOFF else None
+
+    def _flower_category(self, text: str) -> str | None:
+        """把用户输入的品类模糊匹配到表里的品类（「大花马齿」→「大花马齿苋」）。
+
+        相似度低于 FLOWER_CUTOFF 时返回 None，让调用方提示没这个品类。
+        """
+        score, cat = self._flower_best_category(text)
+        return cat if score >= FLOWER_CUTOFF else None
 
     def _flower_full_name(self, color: str, category: str) -> str:
         """把配方里的「色」按品类拼回完整花名：色 + 品类（「青」+「百合」→「青百合」）。
