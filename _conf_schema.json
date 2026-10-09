@@ -1,0 +1,16 @@
+{
+  "platform_mode": {
+    "description": "机器人平台模式",
+    "type": "string",
+    "hint": "qq_official：QQ 官方机器人，支持 Markdown，回复保留 Markdown 标记；onebot：NapCat 等 OneBot 实现，不渲染 Markdown，回复会去掉这些标记。",
+    "default": "onebot",
+    "options": [
+      "onebot",
+      "qq_official"
+    ],
+    "labels": [
+      "OneBot（纯文本）",
+      "QQ 官方机器人（Markdown）"
+    ]
+  }
+}

@@ -1,14 +1,16 @@
-# astrbot-plugin-helloworld
+# 星布谷地漫游指北
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+还没想好怎么写
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+总之依赖是pandas，查询命令使用`/菜谱 <菜名>`
 
-# Supports
+支持模糊搜索，比如`/菜谱 花果茶`可以自动匹配`和煦花果茶`或提示其他菜品
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 配置
+
+在 AstrBot 管理面板的插件配置里选择「机器人平台模式」：
+
+| 选项 | 说明 |
+| --- | --- |
+| `onebot`（默认） | OneBot（NapCat 等），不渲染 Markdown，回复会自动去掉这些标记，只留文字内容 |
+| `qq_official` | QQ 官方机器人，回复支持 Markdown |
