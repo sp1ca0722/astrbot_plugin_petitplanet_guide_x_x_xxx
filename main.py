@@ -406,7 +406,7 @@ class MyPlugin(Star):
             if sorted((color1, color2)) != want:
                 continue
             quality = str(row[2]).strip()
-            hits.append(f"**({quality})**{self._flower_process(color1, color2, category)}\n→ **({quality})**{self._flower_display_name(str(row[1]).strip(), category)}")
+            hits.append(f"{self._flower_process(color1, color2, category)}\n→ **({quality})**{self._flower_display_name(str(row[1]).strip(), category)}")
 
         if not hits:
             return "根本没有这种组合"
