@@ -321,8 +321,9 @@ class MyPlugin(Star):
             if not color1 or not color2:
                 continue  # 基础花没有配方；「？？？」占位行两者皆空
             sym = self._flower_symbol(color1, color2)
+            quality = str(row[2]).strip()
             result = self._flower_short_name(str(row[1]).strip(), category)
-            lines.append(f"{color1} {sym} {color2} → {result}")
+            lines.append(f"{color1} {sym} {color2} → **({quality})**{result}")
         if not lines:
             return f"「{category}」还没有收集到配方"
         return f"### {category}\n" + "\n".join(lines)
@@ -404,7 +405,8 @@ class MyPlugin(Star):
                 continue  # 基础花没有杂交配方，不参与组合反查
             if sorted((color1, color2)) != want:
                 continue
-            hits.append(f"{self._flower_process(color1, color2, category)}\n→ {self._flower_display_name(str(row[1]).strip(), category)}")
+            quality = str(row[2]).strip()
+            hits.append(f"**({quality})**{self._flower_process(color1, color2, category)}\n→ **({quality})**{self._flower_display_name(str(row[1]).strip(), category)}")
 
         if not hits:
             return "根本没有这种组合"
