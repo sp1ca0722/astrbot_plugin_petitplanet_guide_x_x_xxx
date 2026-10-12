@@ -302,7 +302,7 @@ class MyPlugin(Star):
         # 基础花（白品质）没有杂交配方，回复获取方式；「？？？」占位行两者皆空
         if not color1 and not color2:
             way = str(row[5]).strip()
-            return f"{quality} {name}：\n{way or '还没有大佬研究出它的配方orz'}"
+            return f"### {quality} {name}：\n{way or '还没有大佬研究出它的配方orz'}"
         return f"### {quality} {name}：\n{self._flower_process(color1, color2, category)}\n→ {self._flower_display_name(name, category)}"
 
     def _build_flower_list(self, category: str) -> str:

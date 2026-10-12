@@ -1,6 +1,6 @@
 name: astrbot_plugin_petitplanet_guide_x_x_xxx
 display_name: 星布谷地漫游指北
 desc: 星布谷地攻略插件，支持菜谱查询、花的配方查询与反查 # 插件简短描述
-version: v1.1.1
+version: v1.1.2
 author: spica
 repo: https://github.com/sp1ca0722/astrbot_plugin_petitplanet_cuisine # 插件的仓库地址
