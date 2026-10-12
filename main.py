@@ -81,7 +81,7 @@ def strip_markdown(text: str) -> str:
     return text
 
 
-@register("astrbot_plugin_petitplanet_cuisine", "spica", "星布谷地菜谱查询", "1.0.3")
+@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.1.2")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
