@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import tempfile
 import unicodedata
 from difflib import SequenceMatcher
 
@@ -198,7 +197,7 @@ def strip_markdown(text: str) -> str:
     return text
 
 
-@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.1.3")
+@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -312,7 +311,7 @@ class MyPlugin(Star):
         10 备注 11 版本 12 图片路径
         """
         name = str(row[1]).strip()
-        plate, pill = QUALITY_ASSETS[dish_quality(name)]
+        plate = QUALITY_ASSETS[dish_quality(name)][0]
         # 菜品大图：M 列的相对路径（assets/cuisine/…）；没填就用模板自带样图兜底
         dish = str(row[12]).strip() if len(row) > 12 and not pd.isna(row[12]) else ""
         if not dish:
@@ -327,24 +326,48 @@ class MyPlugin(Star):
             "note_icon": f"{CARD_ASSET_DIR}/icon-warning.png",
             "note": note,
         }
-        # 前 4 行是食材：底框跟着食材自身的品质走（表里用 (紫)/(金) 标注）
-        # 该行没有食材时，底框和图标都传空串，模板会把它们一起隐藏
+
+        # 先收集非空食材（跳过中间的空格，否则会出现「第 2 行空、第 3 行有值」的断档）
+        ingredients = []
         for i in range(4):
             cell = row[2 + i] if len(row) > 2 + i else None
             text = "" if cell is None or pd.isna(cell) else str(cell).strip()
             if text:
-                data[f"row{i + 1}_pill"] = f"{CARD_ASSET_DIR}/{QUALITY_ASSETS[ingredient_quality(text)][1]}"
-                data[f"row{i + 1}_icon"] = self.ingredient_icon(text)
-                data[f"row{i + 1}_name"] = ingredient_label(text)
-            else:
-                data[f"row{i + 1}_pill"] = ""
-                data[f"row{i + 1}_icon"] = ""
-                data[f"row{i + 1}_name"] = ""
-
-        # 第 5 行是厨具，没有品质底框
+                ingredients.append(text)
         cooker = "" if pd.isna(row[6]) else str(row[6]).strip()
-        data["row5_icon"] = f"{CARD_ASSET_DIR}/{COOKER_ASSETS.get(cooker, 'cook-cookertype-zhuguo.png')}"
-        data["row5_name"] = cooker
+
+        # 行压缩：食材依次占前几行，厨具紧跟最后一个食材。
+        # 例：只有 2 个食材时，厨具出现在第 3 行，而不是空两行再显示。
+        layout = [("ing", t) for t in ingredients]
+        if cooker:
+            layout.append(("cooker", cooker))
+
+        for i in range(5):
+            key = i + 1          # row1..row5
+            if i >= len(layout):
+                # 剩余行全部留空；第 1~4 行的底框也清空，模板会连同图标一起隐藏
+                if key <= 4:
+                    data[f"row{key}_pill"] = ""
+                data[f"row{key}_icon"] = ""
+                data[f"row{key}_name"] = ""
+                continue
+
+            kind, text = layout[i]
+            if kind == "ing":
+                # 底框跟着食材自身的品质走（表里用 (紫)/(金) 标注）
+                data[f"row{key}_pill"] = (
+                    f"{CARD_ASSET_DIR}/{QUALITY_ASSETS[ingredient_quality(text)][1]}"
+                )
+                data[f"row{key}_icon"] = self.ingredient_icon(text)
+                data[f"row{key}_name"] = ingredient_label(text)
+            else:
+                # 厨具没有品质底框：落在第 1~4 行时把 pill 清空，模板会隐藏它
+                if key <= 4:
+                    data[f"row{key}_pill"] = ""
+                data[f"row{key}_icon"] = (
+                    f"{CARD_ASSET_DIR}/{COOKER_ASSETS.get(text, 'cook-cookertype-zhuguo.png')}"
+                )
+                data[f"row{key}_name"] = text
         return data
 
     @filter.command("flower", alias={'花配方'})
@@ -397,13 +420,15 @@ class MyPlugin(Star):
             return None
 
         try:
-            render_png = load_render_module().render
+            render_mod = load_render_module()
+            render_png = render_mod.render
         except Exception as e:
             logger.error(f"加载 render.py 失败，无法渲染菜谱卡片：{e}")
             return None
         data = self.build_card_data(row)
-        # 输出到临时目录，避免把插件目录越写越大；文件名用菜名方便排查
-        out_dir = os.path.join(tempfile.gettempdir(), "petitplanet_cards")
+        # 输出到 render 的工作根目录（部署时通常已在数据盘上，如 AstrBot 的 data 目录），
+        # 而不是插件目录（避免越写越大）也不是 /tmp（容器里会在 overlay 层）
+        out_dir = os.path.join(render_mod.WORK_ROOT, "cards")
         os.makedirs(out_dir, exist_ok=True)
         safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", base_name(str(row[1])))[:40] or "card"
         png_path = os.path.join(out_dir, f"{safe}.png")
