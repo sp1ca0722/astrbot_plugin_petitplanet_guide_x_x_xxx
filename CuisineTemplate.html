@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <title>食谱卡片模板</title>
+  <style>
+    /* ============================================================
+     画布 911 x 736，坐标 = PSD 绝对像素
+     图片层：left/top = PSD 图层左上角，width/height = 图层尺寸
+     文字层：PSD 文字层的 transform 给的是「基线原点」，所以
+             top = 基线Y - 0.847 × 字号
+             0.847 = ascent(1.0em) - (1.3056em - line-height 1)/2
+             （数值来自 assets/CuisineHtml/zh-cn.ttf 的字体度量，换字体要重算）
+     槽位：.slot 是 159x76，品质底框和食材图标都是这个尺寸，直接叠放
+           4 行统一 left:69px（PSD 里 2、4 行是 70，差 1px，这里拉齐了）
+     菜品图：源图是逐张裁切的，宽高比 0.54~1.71 不统一，所以不写死 width，
+           只统一 height:98px 等比缩放，再用 translateX(-50%) 对齐底盘中心。
+     ============================================================ */
+
+    @font-face {
+      font-family: 'GameFont';
+      src: url('assets/CuisineHtml/zh-cn.ttf') format('truetype');
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+    }
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: #0f5f63;
+    }
+
+    #stage {
+      position: relative;
+      width: 911px;
+      height: 736px;
+      overflow: hidden;
+      font-family: 'GameFont', sans-serif;
+      color: #fff;
+    }
+
+    #stage img {
+      position: absolute;
+      display: block;
+    }
+
+    .txt {
+      position: absolute;
+      line-height: 1;
+      white-space: nowrap;
+      color: #fff;
+      font-weight: 400;
+      letter-spacing: 0;
+    }
+
+    .slot {
+      position: absolute;
+      width: 159px;
+      height: 76px;
+    }
+
+    .slot img {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 159px;
+      height: 76px;
+    }
+
+    /* 食材不满 4 个时，未使用的行传空 src —— 把底框和图标一起隐藏。
+       选择器必须带 #stage：上面的 `#stage img { display: block }` 是 (1,0,1)，
+       而 `.slot img[src=""]` 只有 (0,2,1)，会被盖掉，空 src 就会渲染成破图小图标。 */
+    #stage .slot img:not([src]),
+    #stage .slot img[src=""] {
+      display: none;
+    }
+
+    /* 菜品图：高度统一 98px（顶边 42 保持不动），width:auto 等比缩放不拉伸；
+       水平居中于品质底盘 —— 底盘 left:61 + width:177 → 中心 149.5，
+       translateX(-50%) 按图片自身宽度回退半个身位，所以窄图宽图都居中。 */
+    #dish {
+      left: 149.5px;
+      top: 42px;
+      height: 98px;
+      width: auto;
+      transform: translateX(-50%);
+    }
+
+    #title {
+      font-size: 72px;
+    }
+
+    .name {
+      font-size: 36px;
+    }
+
+    /* 右下角备注：整块靠右（文字右对齐靠右锚点实现），
+       感叹号与文字同在一个 flex 行里，间距恒定 —— 文字变长只会往左长，
+       感叹号始终贴着首字左侧走 */
+    #note {
+      position: absolute;
+      right: 23px;
+      /* 文字块右边缘 */
+      top: 681px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      /* 感叹号与文字垂直居中 */
+      gap: 24px;
+      /* 感叹号右缘 → 文字左缘的固定间距（到首字墨迹约 25px，汉字自带 1px 左边距） */
+    }
+
+    #note img {
+      position: static;
+      /* 覆盖 #stage img 的绝对定位，让它参与 flex 排版 */
+      width: 21px;
+      height: 40px;
+    }
+
+    /* 备注文字为空时整块隐藏，否则会只剩一个孤立的感叹号 */
+    #note:has(.note-text:empty) {
+      display: none;
+    }
+
+    #note .note-text {
+      position: relative;
+      top: 1px;
+      /* PSD 里文字比图标几何居中低 1px */
+      font-size: 30px;
+      line-height: 1;
+      white-space: nowrap;
+      color: #fff;
+      font-weight: 400;
+      letter-spacing: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="stage">
+
+    <!-- 背景 -->
+    <img src="{{bg}}" style="left:0; top:0; width:911px; height:736px">
+
+    <!-- 左上：品质底盘 + 菜品图（等比、水平居中，见 #dish 规则） -->
+    <img src="{{plate}}" style="left:61px; top:67px; width:177px; height:115px">
+    <img id="dish" src="{{dish}}">
+
+    <!-- 标题（基线 142.62） -->
+    <div class="txt" id="title" style="left:281.7px; top:81.6px">{{title}}</div>
+
+    <!-- 第 1 行 -->
+    <div class="slot" style="left:69px; top:225px">
+      <img src="{{row1_pill}}">
+      <img src="{{row1_icon}}">
+    </div>
+    <div class="txt name" style="left:280.4px; top:244.8px">{{row1_name}}</div>
+
+    <!-- 第 2 行 -->
+    <div class="slot" style="left:69px; top:321px">
+      <img src="{{row2_pill}}">
+      <img src="{{row2_icon}}">
+    </div>
+    <div class="txt name" style="left:280.4px; top:340.8px">{{row2_name}}</div>
+
+    <!-- 第 3 行 -->
+    <div class="slot" style="left:69px; top:418px">
+      <img src="{{row3_pill}}">
+      <img src="{{row3_icon}}">
+    </div>
+    <div class="txt name" style="left:280.4px; top:437.8px">{{row3_name}}</div>
+
+    <!-- 第 4 行 -->
+    <div class="slot" style="left:69px; top:515px">
+      <img src="{{row4_pill}}">
+      <img src="{{row4_icon}}">
+    </div>
+    <div class="txt name" style="left:280.2px; top:535.3px">{{row4_name}}</div>
+
+    <!-- 第 5 行：厨具（没有品质底框） -->
+    <div class="slot" style="left:75px; top:613px">
+      <img src="{{row5_icon}}">
+    </div>
+    <div class="txt name" style="left:281.4px; top:632.8px">{{row5_name}}</div>
+
+    <!-- 右侧角色卡 -->
+    <img src="{{card}}" style="left:514px; top:263px; width:330px; height:365px">
+
+    <!-- 右下角备注：感叹号 + 文字（整块靠右，文字右对齐，感叹号跟着首字左缘走） -->
+    <div id="note">
+      <img src="{{note_icon}}">
+      <span class="note-text">{{note}}</span>
+    </div>
+
+  </div>
+</body>
+
+</html>

@@ -6,7 +6,15 @@
 
 ### 依赖
 
-需要使用`pandas`来读取表格文件
+需要 `pandas` 读取表格、`openpyxl` 解析 xlsx，已写在插件根目录的 `requirements.txt` 里。AstrBot 在安装插件时会自动读这个文件并装好缺失的依赖（启动加载插件时也会再检查一次），通常不需要手动装。
+
+如果装完之后日志里出现 `ModuleNotFoundError: No module named 'pandas'`，说明你的 AstrBot 版本比较老或这次自动安装失败了，可以在 WebUI 的 `数据与日志 → 日志 → 安装 pip 包` 里手动安装 `pandas openpyxl`，或者直接在本体虚拟环境里执行：
+
+```bash
+pip install -r requirements.txt
+```
+
+> `/菜谱` 查不到菜时会用 AI 兜底（需要环境变量 `DEEPSEEK_API_KEY`），这条链路依赖 AstrBot 本体已自带的 `openai` 包，无需额外安装。
 
 ### 配置
 

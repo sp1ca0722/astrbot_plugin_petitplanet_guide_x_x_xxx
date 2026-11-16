@@ -1,0 +1,6 @@
+pandas>=2.2.0
+openpyxl>=3.1.5
+# 菜谱卡片渲染：用 websockets 的同步客户端走 CDP，复用常驻 Chrome（~70ms vs ~1.2s）。
+# 没装也能用，会自动回落到一次性 chrome --screenshot。
+websockets>=12
+

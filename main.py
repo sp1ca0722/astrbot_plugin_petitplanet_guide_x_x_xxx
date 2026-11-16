@@ -1,13 +1,14 @@
 import asyncio
 import os
 import re
+import tempfile
 import unicodedata
 from difflib import SequenceMatcher
 
 import pandas as pd
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 
@@ -24,8 +25,42 @@ CMD_PREFIX = re.compile(
     r"^\s*/?\s*(?:recipe|cuisine|食谱|菜谱)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
 )
 # 数据表跟 main.py 放一起，避免受 AstrBot 启动目录影响
-EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuisine.xlsx")
-FLOWER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flower.xlsx")
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_PATH = os.path.join(PLUGIN_DIR, "cuisine.xlsx")
+FLOWER_PATH = os.path.join(PLUGIN_DIR, "flower.xlsx")
+
+# ---- 菜谱卡片的静态资源（CuisineTemplate.html + render.py）----
+CARD_ASSET_DIR = "assets/CuisineHtml"  # 相对插件目录，写进 HTML 的路径
+CARD_TEMPLATE = os.path.join(PLUGIN_DIR, "CuisineTemplate.html")
+# cuisine.xlsx 里的第二张表：食材值 → 图标名
+ICON_SHEET = "图标"
+ICON_FILE_PREFIX = "cook-foodtype-"
+# 品质 → (底盘, 食材底框)。表里没有品质标注的基础菜按「白」处理
+QUALITY_ASSETS = {
+    "白": ("bg-quality-white.png", "cook-bg-icon-white.png"),
+    "蓝": ("bg-quality-blue.png", "cook-bg-icon-white.png"),  # 无蓝底框，用白
+    "紫": ("bg-quality-purple.png", "cook-bg-icon-purple.png"),
+    "金": ("bg-quality-gold.png", "cook-bg-icon-gold.png"),
+}
+# 厨具 → 图标（「图标」表只盖食材，厨具在这里兜底）
+COOKER_ASSETS = {
+    "煮锅": "cook-cookertype-zhuguo.png",
+    "烤箱": "cook-cookertype-kaoxiang.png",
+    "榨汁机": "cook-cookertype-zhazhiji.png",
+}
+CARD_NOTE_TEXT = "该信息来自于三测"
+# 卡片输出倍数：0.8 → 画布 911x736 出图 729x589，群里刷屏不至于太大
+CARD_RENDER_SCALE = 0.8
+
+# render.py 的模块缓存（按文件路径加载，见 load_render_module）
+_RENDER_MODULE = None
+# 图片测试用的样图，同样按插件目录定位（/imagetest）
+TEST_IMAGE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "cuisine",
+    "2000050_GameplayEntity_Cook_Meat_b.png",
+)
 # 花配方指令前缀，剥掉 “/花配方”“/flower” 这类头，兼容带不带斜杠/空格
 FLOWER_CMD_PREFIX = re.compile(
     r"^\s*/?\s*(?:花配方|flowerrecipe|flower)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
@@ -33,6 +68,10 @@ FLOWER_CMD_PREFIX = re.compile(
 # 花组合指令前缀，剥掉 “/花组合”“/flowercombo” 这类头
 COMBO_CMD_PREFIX = re.compile(
     r"^\s*/?\s*(?:花组合|flowercombo)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
+)
+# 菜谱卡片指令前缀，剥掉 “/卡片”“/card”“/菜谱卡片” 这类头
+CARD_CMD_PREFIX = re.compile(
+    r"^\s*/?\s*(?:card|菜谱卡片|卡片)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
 )
 
 # 平台模式（_conf_schema.json 里的 platform_mode）：只有 QQ 官方机器人渲染 Markdown
@@ -57,6 +96,84 @@ def base_name(text: str) -> str:
     """全角转半角 → 去首尾空白 → 剥掉尾部的括号标注。"""
     s = unicodedata.normalize("NFKC", str(text)).strip()
     return NAME_TAIL.sub("", s).strip() or s
+
+
+# 表格里存在 '[ 贝类]'、'荤 菜'、' 煮锅' 这类夹空格/首空格的脏数据，比对前一律抹平
+WS_ALL = re.compile(r"\s+")
+# 尾部品质标注：(紫) ( 金) [*紫*]
+QUALITY_PAREN = re.compile(r"\(\s*\*?([^()\[\]]*?)\*?\s*\)$")
+QUALITY_BRACKET = re.compile(r"\[\s*\*?([^()\[\]]*?)\*?\s*\]$")
+
+
+def squash(text) -> str:
+    """全角转半角 + 抹掉所有空白，用于把表格里的脏数据归一化。"""
+    return WS_ALL.sub("", unicodedata.normalize("NFKC", str(text if text is not None else "")))
+
+
+def ingredient_key(text) -> str:
+    """食材值 → 「图标」表的匹配键：抹空白 + 剥掉尾部品质标注。
+
+    例：[水果类](紫) → [水果类]；茄子[*紫*] → 茄子；[素菜]/[荤菜] 原样保留
+    （以 [ 开头的类别值，末尾的方括号是类别本身，不能剥）。
+    """
+    s = squash(text)
+    m = QUALITY_PAREN.search(s)
+    if m and m.start() > 0:
+        s = s[: m.start()]
+    m = QUALITY_BRACKET.search(s)
+    if m and m.start() > 0 and not s.startswith("["):
+        s = s[: m.start()]
+    return s
+
+
+def ingredient_quality(text) -> str:
+    """从食材值里取出品质（白/蓝/紫/金），没有标注就当白。"""
+    s = squash(text)
+    for pattern in (QUALITY_PAREN, QUALITY_BRACKET):
+        m = pattern.search(s)
+        if m and m.start() > 0:
+            q = m.group(1)
+            return q if q in QUALITY_ASSETS else "白"
+    return "白"
+
+
+def ingredient_label(text) -> str:
+    """食材值的显示名：剥品质标注 + 去方括号，如 [素菜]/[荤菜](紫) → 素菜/荤菜。"""
+    return ingredient_key(text).replace("[", "").replace("]", "")
+
+
+def dish_quality(name) -> str:
+    """从菜名尾部取品质：…(紫) → 紫；没有标注 → 白。"""
+    m = QUALITY_PAREN.search(squash(name))
+    if m and m.group(1) in QUALITY_ASSETS:
+        return m.group(1)
+    return "白"
+
+
+def load_render_module():
+    """按文件路径加载同目录的 render.py，并缓存。
+
+    不能写 `from render import render`：AstrBot 把插件当**包**加载，
+    本文件的实际模块名是 `<插件目录名>.main`，而插件目录并不在 sys.path 里，
+    所以顶层的 `import render` 会抛 ModuleNotFoundError。
+    按文件路径加载（importlib）不依赖 sys.path，也不会与其它插件的同名模块冲突。
+    """
+    global _RENDER_MODULE
+    if _RENDER_MODULE is not None:
+        return _RENDER_MODULE
+
+    import importlib.util
+
+    path = os.path.join(PLUGIN_DIR, "render.py")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"找不到渲染脚本：{path}")
+    spec = importlib.util.spec_from_file_location("petitplanet_card_render", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载渲染脚本：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # __file__ 指向该路径，render 内部的相对目录才正确
+    _RENDER_MODULE = module
+    return module
 
 
 def strip_markdown(text: str) -> str:
@@ -90,7 +207,10 @@ class MyPlugin(Star):
         self._rows = []
         self._names = []
         self._base_names = []
-        self._source = ""  # 表头 L1、M1：数据来源与更新日期
+        self._source = ""  # 表头 L 列：版本（兼作数据来源说明）
+        # 食材图标（cuisine.xlsx 的「图标」表）：食材值 → 图标名
+        self._icon_map = {}
+        self._icon_fallback = ""  # 「*」行，未匹配时用
         # 花配方表（flower.xlsx）：列 = 类别|花色|品质|配方1|配方2|获取方式|版本
         self._flower_rows = []
         self._flower_names = []  # 第 1 列：花的完整名（配色+品类）
@@ -105,16 +225,25 @@ class MyPlugin(Star):
             logger.error(f"读取 cuisine.xlsx 失败（{EXCEL_PATH}）：{e}")
             return
 
+        # 表格第 1 行是表头，其余行是数据；菜名空白的行跳过（表格常有多余空行）
+        header = df.iloc[0].tolist()
         # 用列表下标定位，避免再拿标签回查 DataFrame（下标是 int，类型干净）
-        self._rows = df.iloc[1:].values.tolist()
+        self._rows = [
+            row
+            for row in df.iloc[1:].values.tolist()
+            if not pd.isna(row[1]) and str(row[1]).strip()
+        ]
         self._names = [str(row[1]).strip() for row in self._rows]  # 菜品名在第 1 列
         self._base_names = [base_name(name) for name in self._names]  # 剥掉标注后的主体名
-        # 表头首行的 L、M 两格是「数据来源」「更新日期」，供 /菜谱 源 查询
-        header = df.iloc[0].tolist()
+        # 表头 L 列是版本（兼作数据来源），供 /菜谱 源 查询
+        # 注意：M 列已被「图片」占用，不能再取 header[11:13]
         self._source = "\n".join(
-            str(cell).strip() for cell in header[11:13] if not pd.isna(cell) and str(cell).strip()
+            str(cell).strip() for cell in header[11:12] if not pd.isna(cell) and str(cell).strip()
         )
         logger.info(f"菜谱加载完成，共 {len(self._rows)} 条；平台模式：{self._platform_mode()}")
+
+        # 食材图标映射：读失败只影响卡片，不影响文本查询
+        await self._load_icons()
 
         # 花配方表单独加载：读失败不影响菜谱功能
         try:
@@ -130,6 +259,94 @@ class MyPlugin(Star):
         self._flower_cats = list(dict.fromkeys(str(row[0]).strip() for row in self._flower_rows))
         logger.info(f"花配方加载完成，共 {len(self._flower_rows)} 条")
 
+    async def _load_icons(self):
+        """读「图标」sheet，建立 食材值 → 图标名 的映射（供菜谱卡片用）。
+
+        表结构：匹配键 | 图标 | 类型 | 出现次数 | 说明
+        - 匹配键是食材值（`[蔬菜类]`、`番茄`）或兜底 `*`
+        - 图标列只填图标名（`veg`），实际文件是 assets/CuisineHtml/cook-foodtype-<名>.png
+        读失败或表不存在时只打日志，菜谱文本查询不受影响。
+        """
+        try:
+            gdf = await asyncio.to_thread(
+                pd.read_excel, EXCEL_PATH, sheet_name=ICON_SHEET, header=None
+            )
+        except Exception as e:
+            logger.warning(f"读取「{ICON_SHEET}」表失败，菜谱卡片将不显示食材图标：{e}")
+            return
+
+        mapping, fallback, missing = {}, "", set()
+        # 第 1 行是表头（匹配键|图标|类型|出现次数|说明），其余是映射
+        for row in gdf.iloc[1:].values.tolist():
+            key = ingredient_key(row[0]) if not pd.isna(row[0]) else ""
+            if not key:
+                continue
+            stem = str(row[1]).strip() if len(row) > 1 and not pd.isna(row[1]) else ""
+            if stem and not os.path.isfile(os.path.join(PLUGIN_DIR, CARD_ASSET_DIR, ICON_FILE_PREFIX + stem + ".png")):
+                missing.add(stem)
+            if key == "*":
+                fallback = stem
+            else:
+                mapping[key] = stem
+
+        self._icon_map = mapping
+        self._icon_fallback = fallback
+        logger.info(f"食材图标加载完成，共 {len(mapping)} 条映射，兜底：{fallback or '无'}")
+        if missing:
+            logger.warning(f"「{ICON_SHEET}」表引用了不存在的图标文件：{sorted(missing)}")
+
+    def ingredient_icon(self, text) -> str:
+        """食材值 → 图标的相对路径（assets/CuisineHtml/cook-foodtype-*.png）。
+
+        匹配顺序：完整食材值 → 兜底 `*`；都没有返回空字符串（模板会隐藏空 src 的图）。
+        """
+        stem = self._icon_map.get(ingredient_key(text))
+        if stem is None:
+            stem = self._icon_fallback
+        return f"{CARD_ASSET_DIR}/{ICON_FILE_PREFIX}{stem}.png" if stem else ""
+
+    def build_card_data(self, row: list, note: str = CARD_NOTE_TEXT) -> dict:
+        """把一行菜谱数据转成 CuisineTemplate.html 需要的占位符字典。
+
+        row 的列序（0 起）：0 分类 1 菜名 2-5 食材1-4 6 烹饪方式 …
+        10 备注 11 版本 12 图片路径
+        """
+        name = str(row[1]).strip()
+        plate, pill = QUALITY_ASSETS[dish_quality(name)]
+        # 菜品大图：M 列的相对路径（assets/cuisine/…）；没填就用模板自带样图兜底
+        dish = str(row[12]).strip() if len(row) > 12 and not pd.isna(row[12]) else ""
+        if not dish:
+            dish = f"{CARD_ASSET_DIR}/cook-dish.png"
+
+        data = {
+            "bg": f"{CARD_ASSET_DIR}/bg.png",
+            "plate": f"{CARD_ASSET_DIR}/{plate}",
+            "dish": dish,
+            "card": f"{CARD_ASSET_DIR}/cook-card.png",
+            "title": base_name(name),
+            "note_icon": f"{CARD_ASSET_DIR}/icon-warning.png",
+            "note": note,
+        }
+        # 前 4 行是食材：底框跟着食材自身的品质走（表里用 (紫)/(金) 标注）
+        # 该行没有食材时，底框和图标都传空串，模板会把它们一起隐藏
+        for i in range(4):
+            cell = row[2 + i] if len(row) > 2 + i else None
+            text = "" if cell is None or pd.isna(cell) else str(cell).strip()
+            if text:
+                data[f"row{i + 1}_pill"] = f"{CARD_ASSET_DIR}/{QUALITY_ASSETS[ingredient_quality(text)][1]}"
+                data[f"row{i + 1}_icon"] = self.ingredient_icon(text)
+                data[f"row{i + 1}_name"] = ingredient_label(text)
+            else:
+                data[f"row{i + 1}_pill"] = ""
+                data[f"row{i + 1}_icon"] = ""
+                data[f"row{i + 1}_name"] = ""
+
+        # 第 5 行是厨具，没有品质底框
+        cooker = "" if pd.isna(row[6]) else str(row[6]).strip()
+        data["row5_icon"] = f"{CARD_ASSET_DIR}/{COOKER_ASSETS.get(cooker, 'cook-cookertype-zhuguo.png')}"
+        data["row5_name"] = cooker
+        return data
+
     @filter.command("flower", alias={'花配方'})
     async def flower(self, event: AstrMessageEvent):
         """查询花配方：/花配方 花名 或品类（品类列出整类配方），也可 /花配方 品类 品质（如：/花配方 百合 蓝）"""
@@ -143,6 +360,62 @@ class MyPlugin(Star):
         target = COMBO_CMD_PREFIX.sub("", event.message_str).strip()
         text = self._render(self._build_combo_reply(target))
         yield event.plain_result(text)
+
+    @filter.command("imagetest", alias={'图片测试'})
+    async def imagetest(self, event: AstrMessageEvent):
+        """测试发送本地图片：/imagetest"""
+        if not os.path.isfile(TEST_IMAGE_PATH):
+            logger.error(f"测试图片不存在：{TEST_IMAGE_PATH}")
+            yield event.plain_result(f"测试图片不存在：{TEST_IMAGE_PATH}")
+            return
+        # fromFileSystem 会把路径转成 file:///...，OneBot 适配器（NapCat）可直接读取本机文件
+        yield event.chain_result([Image.fromFileSystem(TEST_IMAGE_PATH)])
+
+    @filter.command("card", alias={'菜谱卡片'})
+    async def card(self, event: AstrMessageEvent):
+        """渲染菜谱卡片图片：/卡片 菜名（渲染失败时退化成文本结果）"""
+        target = CARD_CMD_PREFIX.sub("", event.message_str).strip()
+        png = await self._render_card(target)
+        if not png:
+            # 渲染不可用（没装 Chrome / 模板缺失 / 菜名没匹配上）时退回文本，不让命令彻底失败
+            text = self._render(await self._build_reply(target))
+            yield event.plain_result(text)
+            return
+        try:
+            await event.send(MessageChain([Image.fromFileSystem(png)]))
+        except Exception as e:
+            logger.error(f"发送菜谱卡片失败：{e}")
+        event.stop_event()
+        yield
+
+    async def _render_card(self, target: str) -> str | None:
+        """把匹配到的菜渲染成 PNG，返回图片路径；任何环节出问题都返回 None。"""
+        if not self._rows or not target:
+            return None
+        row, _, _ = self._match_dish(target)
+        if row is None:
+            return None
+
+        try:
+            render_png = load_render_module().render
+        except Exception as e:
+            logger.error(f"加载 render.py 失败，无法渲染菜谱卡片：{e}")
+            return None
+        data = self.build_card_data(row)
+        # 输出到临时目录，避免把插件目录越写越大；文件名用菜名方便排查
+        out_dir = os.path.join(tempfile.gettempdir(), "petitplanet_cards")
+        os.makedirs(out_dir, exist_ok=True)
+        safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", base_name(str(row[1])))[:40] or "card"
+        png_path = os.path.join(out_dir, f"{safe}.png")
+        logger.info(f"开始渲染菜谱卡片：{row[1]} -> {png_path}")
+        try:
+            # render 内部会拉 Chrome 子进程，扔到线程里避免阻塞事件循环
+            # use_cache=True：同一道菜重复查询直接复用上次的 PNG
+            await asyncio.to_thread(render_png, data, png_path, CARD_RENDER_SCALE, True)
+        except Exception as e:
+            logger.error(f"渲染菜谱卡片失败：{e}")
+            return None
+        return png_path if os.path.isfile(png_path) else None
 
     @filter.command("recipe", alias={'菜谱', '食谱'})
     async def cuisine(self, event: AstrMessageEvent):
@@ -172,6 +445,8 @@ class MyPlugin(Star):
             "### 使用帮助\n\n"
             "`/食谱 菜名`(可模糊搜索)\n"
             "- 返回这道菜的食材和做法\n\n"
+            "`/卡片 菜名`(可模糊搜索)\n"
+            "- 把这道菜渲染成图片卡片\n\n"
 #            "`/菜详情 菜名`(可模糊搜索)\n"
 #            "- 返回这道菜具体信息\n"
             "`/许愿 许愿内容`\n"
@@ -194,29 +469,13 @@ class MyPlugin(Star):
             return "菜谱数据没加载成功，请检查 cuisine.xlsx 是否放在插件目录下。"
         if not target:
             return "请输入菜名，例如：/食谱 和煦花果茶"
-        # 「源」是固定关键词：直接回表头的 L1、M1（数据来源、更新日期），不走模糊匹配
+        # 「源」是固定关键词：直接回表头的 L1（版本/数据来源），不走模糊匹配
         if target == "源":
-            return self._source or "表格里没有填写数据来源与更新日期。"
+            return self._source or "表格里没有填写数据来源。"
 
-        # 用主体名算相似度：输入“梦幻番茄汤汁面”和表里的“梦幻番茄汤汁面(金)”就是完全一致(1.0)
-        target_base = base_name(target)
-        scored = [
-            (SequenceMatcher(None, target_base, base).ratio(), pos)
-            for pos, base in enumerate(self._base_names)
-        ]
-        # key 只按分数排，稳定性保证同分时仍是表里的先后顺序
-        matched = sorted(
-            (item for item in scored if item[0] >= CUTOFF),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        if not matched:
+        row, best_score, matched = self._match_dish(target)
+        if row is None:
             return await self._ask_ai(target)
-
-        best_score, best_pos = matched[0]
-        # 有特殊效果才打印；注意判断和打印要用同一个下标，否则会打印出空行
-        row = ["" if pd.isna(cell) else cell for cell in self._rows[best_pos]]
 
         lines = []
         if best_score < 1:
@@ -234,6 +493,30 @@ class MyPlugin(Star):
             lines.append("> **或是其他的菜？**")
             lines.append("> " + " ".join(self._names[pos] for _, pos in matched[1:]))
         return "\n".join(lines)
+
+    def _match_dish(self, target: str) -> tuple[list | None, float, list]:
+        """模糊匹配菜名，返回 (行数据, 匹配分, [(分, 下标)...])；没匹配上时行是 None。
+
+        文本回复和菜谱卡片都要用同一套匹配，抽出来避免两处逻辑跑偏。
+        """
+        # 用主体名算相似度：输入“梦幻番茄汤汁面”和表里的“梦幻番茄汤汁面(金)”就是完全一致(1.0)
+        target_base = base_name(target)
+        scored = [
+            (SequenceMatcher(None, target_base, base).ratio(), pos)
+            for pos, base in enumerate(self._base_names)
+        ]
+        # key 只按分数排，稳定性保证同分时仍是表里的先后顺序
+        matched = sorted(
+            (item for item in scored if item[0] >= CUTOFF),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not matched:
+            return None, 0.0, []
+        best_score, best_pos = matched[0]
+        # 有特殊效果才打印；注意判断和打印要用同一个下标，否则会打印出空行
+        row = ["" if pd.isna(cell) else cell for cell in self._rows[best_pos]]
+        return row, best_score, matched
 
     async def _build_flower_reply(self, target: str) -> str:
         """把花配方查询结果整理成要回复的纯文本。
@@ -262,7 +545,7 @@ class MyPlugin(Star):
         """「品类 + 品质」查询：先模糊匹配品类（「大花马齿」→「大花马齿苋」），再列该品质的花。"""
         cat = self._flower_category(category_text)
         if cat is None:
-            return f"没有「{category_text}」这个品类哦"
+            return f"根本没有这种花"
         hits = [
             row
             for row in self._flower_rows
@@ -492,4 +775,8 @@ class MyPlugin(Star):
         return response.choices[0].message.content or "没有这道菜哦。"
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件被卸载/停用时会调用：把常驻的渲染用 Chrome 收掉，别留孤儿进程。"""
+        try:
+            load_render_module().shutdown()
+        except Exception as e:
+            logger.warning(f"关闭渲染用 Chrome 失败：{e}")
