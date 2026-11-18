@@ -1,7 +1,12 @@
 import asyncio
+import hashlib
+import json
 import os
+import random
 import re
+import time
 import unicodedata
+from collections import OrderedDict
 from difflib import SequenceMatcher
 
 import pandas as pd
@@ -48,6 +53,32 @@ COOKER_ASSETS = {
     "榨汁机": "cook-cookertype-zhazhiji.png",
 }
 CARD_NOTE_TEXT = "该信息来自于三测"
+# 卡片消息里最多列几个「其它的菜」（防止一次刷出几十个名字）。
+# 指令按钮每行最多 5 个、最多 5 行，这里取 10 正好两行。
+CARD_HINT_LIMIT = 10
+
+# ---- QQ 官方：一条消息里「内嵌图 + 指令按钮」----
+# 图片会被发成富媒体（msg_type=7）并剥掉 markdown 字段，导致 ** 显示成原样。
+# 想同时要图片和按钮，只能走 markdown（msg_type=2）内嵌图：
+#   1) POST /v2/media-images/prepare  拿预签名 URL
+#   2) PUT 预签名 URL 直传二进制
+#   3) POST /v2/media-images/complete 拿 qqbot-media:// 引用
+#   4) 发送 markdown（可带 keyboard），发完 DELETE 释放配额（上限 100 张）
+# 卡片图用 JPEG 而非 PNG：卡片背景整幅不透明、不需要 alpha，
+# 实测同一张卡 JPEG(q95) 体积只有 PNG 的 1/4.8，编码还更快，
+# 连带让素材上传和消息下发（平台要转存/分发图片）都变快。
+CARD_MEDIA_FILE_NAME = "card.jpg"
+CARD_MEDIA_CONTENT_TYPE = "image/jpeg"
+CARD_OUTPUT_EXT = ".jpg"  # 渲染产物扩展名，要与上面的 Content-Type 一致
+CARD_MEDIA_MAX_BYTES = 10 * 1024 * 1024  # 官方单张上限
+CARD_BUTTON_PER_ROW = 5  # 官方：每行最多 5 个
+CARD_BUTTON_MAX_ROWS = 5  # 官方：最多 5 行
+CARD_BUTTON_LABEL_MAX = 12  # 按钮文字太长会被截断，这里自己先截
+# 素材引用缓存条数上限。官方配额是 100 张，而菜有 104 道，留点余量取 90。
+# 缓存落盘（media_cache.json）：qqbot-media 引用有效期是 90 天（滑动），
+# 存到磁盘后插件重启也不用重新上传，直接省掉 prepare/PUT/complete 约 1.45s。
+CARD_MEDIA_CACHE_MAX = 90
+MEDIA_CACHE_FILE = "media_cache.json"
 # 卡片输出倍数：0.8 → 画布 911x736 出图 729x589，群里刷屏不至于太大
 CARD_RENDER_SCALE = 0.8
 
@@ -171,8 +202,28 @@ def load_render_module():
         raise ImportError(f"无法加载渲染脚本：{path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # __file__ 指向该路径，render 内部的相对目录才正确
+    # 把插件 logger 塞进去：render.py 默认用 print / 标准 logging，那样计时不会进机器人日志。
+    # 用 setattr：动态模块在静态检查里是 ModuleType，直接赋值会报「属性未知」。
+    setattr(module, "LOGGER", logger)
     _RENDER_MODULE = module
     return module
+
+
+def _step_start(step: str) -> float:
+    """记一条「步骤开始」日志，返回起始时间戳（交给 _step_end 算耗时）。
+
+    用 perf_counter 而不是 time.time：它不受系统时钟校时影响，适合量耗时。
+    标记用纯 ASCII 的 >> / <<：Windows 的 GBK 控制台编不了 ▶ 之类的字符。
+    """
+    logger.info(f"[计时] >> {step} 开始")
+    return time.perf_counter()
+
+
+def _step_end(step: str, started: float) -> int:
+    """记一条「步骤结束 + 耗时」日志，返回耗时毫秒数（方便上层汇总）。"""
+    ms = int((time.perf_counter() - started) * 1000)
+    logger.info(f"[计时] << {step} 结束，用时 {ms}ms")
+    return ms
 
 
 def strip_markdown(text: str) -> str:
@@ -215,6 +266,8 @@ class MyPlugin(Star):
         self._flower_names = []  # 第 1 列：花的完整名（配色+品类）
         self._flower_base = []  # 剥掉标注后的主体名，用于精确匹配
         self._flower_cats = []  # 去重后的品类名，用于把输入的品类模糊匹配到表里的品类
+        # 图片内容哈希 → {url, image_id}：QQ 素材库引用缓存（LRU，复用可省一次上传）
+        self._media_cache: OrderedDict = OrderedDict()
 
     async def initialize(self):
         """插件实例化后自动调用：把菜谱表读进内存，之后每次查询不再碰磁盘。"""
@@ -243,6 +296,20 @@ class MyPlugin(Star):
 
         # 食材图标映射：读失败只影响卡片，不影响文本查询
         await self._load_icons()
+
+        # 预热常驻 Chrome：冷启动实测 6.6s（ARM 容器），提前在后台拉起来，
+        # 别让第一个用 /卡片 的人白等。预热失败无所谓，按需启动仍然可用。
+        try:
+            render_mod = load_render_module()
+            prewarm = getattr(render_mod, "prewarm", None)
+            if prewarm is not None and getattr(render_mod, "USE_RESIDENT", False):
+                asyncio.create_task(asyncio.to_thread(prewarm, CARD_RENDER_SCALE))
+                logger.info("已在后台预热渲染用 Chrome（首次冷启动约 6s，之后直接复用）")
+        except Exception as e:
+            logger.warning(f"预热渲染用 Chrome 失败（不影响按需启动）：{e}")
+
+        # 把上次落盘的素材引用读回来：命中的菜直接跳过上传（省 prepare/PUT/complete 约 1.45s）
+        self._load_media_cache()
 
         # 花配方表单独加载：读失败不影响菜谱功能
         try:
@@ -394,20 +461,169 @@ class MyPlugin(Star):
         # fromFileSystem 会把路径转成 file:///...，OneBot 适配器（NapCat）可直接读取本机文件
         yield event.chain_result([Image.fromFileSystem(TEST_IMAGE_PATH)])
 
-    @filter.command("card", alias={'菜谱卡片'})
+    @filter.command("linktest", alias={'链接测试'})
+    async def linktest(self, event: AstrMessageEvent):
+        """实验：两条「可点击交互」路线各发一条，真机点一下就知道哪条能用。
+
+        第 1 条：markdown 链接（对照组）。官方文档说 markdown 链接点击 = 打开网页，
+                 如果你实测那个 bot 的蓝字真是 markdown 链接且能填入输入框，这条会复现。
+        第 2 条：keyboard 指令按钮（action.type=2）。官方文档原话：「自动在输入框插入 @bot data」，
+                 和你截图里输入框出现「@小呱呱 /人气精灵」的形态完全一致 —— 主候选。
+                 AstrBot 消息链没有 Keyboard 组件，这里绕过它直接调 botpy 的 post_group_message。
+        """
+        # —— 路线 1：markdown 链接 ——
+        md_text = "\n".join(
+            [
+                "【实验 1/2】markdown 链接（对照组）",
+                "点下面蓝字，预期只会打开网页，不会填入输入框：",
+                "[🔗 点我试试（https 链接）](https://www.qq.com)",
+            ]
+        )
+        chain = MessageChain([Plain(md_text)])
+        # 显式强制 markdown（msg_type=2），不依赖平台默认。
+        # 用 setattr：服务器上的 astrbot 有这个字段，但本地 Pylance 解析的是旧版类型桩，会误报。
+        setattr(chain, "use_markdown_", True)
+        try:
+            await event.send(chain)
+        except Exception as e:
+            logger.error(f"发送 markdown 链接测试失败：{e}")
+
+        # —— 路线 2：keyboard 指令按钮 ——
+        try:
+            # getattr 间接调用：服务器上的 AstrBot 有这个方法，本地 Pylance 解析的是旧版类型桩，会误报
+            get_inst = getattr(self.context, "get_platform_inst", None)
+            if get_inst is None:
+                raise RuntimeError("当前 AstrBot 版本不支持 get_platform_inst")
+            adapter = get_inst(event.get_platform_id())
+            client = adapter.get_client()
+            source = event.message_obj
+            keyboard = {
+                "rows": [
+                    {
+                        "buttons": [
+                            {
+                                "id": "probe1",
+                                "render_data": {
+                                    "label": "🌸 花配方 百合",
+                                    "visited_label": "已填入",
+                                    "style": 1,
+                                },
+                                "action": {
+                                    "type": 2,  # 指令按钮：自动在输入框插入 @bot + data
+                                    "permission": {"type": 2},  # 所有人可点
+                                    "data": "/花配方 百合",
+                                    "unsupport_tips": "当前QQ版本不支持，请升级",
+                                },
+                            },
+                            {
+                                "id": "probe2",
+                                "render_data": {
+                                    "label": "🍳 卡片 杏鲍菇",
+                                    "visited_label": "已填入",
+                                    "style": 1,
+                                },
+                                "action": {
+                                    "type": 2,
+                                    "permission": {"type": 2},
+                                    "data": "/卡片 杏鲍菇",
+                                    "unsupport_tips": "当前QQ版本不支持，请升级",
+                                },
+                            },
+                        ]
+                    }
+                ]
+            }
+            kb_md = {"content": "【实验 2/2】keyboard 指令按钮\n点下面的蓝色按钮，预期把「/花配方 百合」填入输入框：\n"}
+            # botpy 不对 keyboard 做序列化包装，直接透传；官方 API 要求 keyboard = {"content": {rows}}
+            keyboard_payload = {"content": keyboard}
+            # event.message_obj 是 AstrBotMessage（AstrBot 自己的包装），没有 botpy 的
+            # group_openid / user_openid 字段 —— 上一版就是因此走了「认不出目标」分支。
+            # 适配器自己的做法：群消息时 abm.group_id = message.group_openid，
+            # 私聊时 abm.session_id = sender.user_id。所以用 is_private_chat 分流，
+            # 群取 get_group_id()（空则退回 session_id），私聊取 session_id。
+            msg_id = getattr(source, "message_id", None)
+            seq = random.randint(1, 10000)
+            if event.is_private_chat():
+                await client.api.post_c2c_message(
+                    openid=event.session_id,
+                    msg_type=2,
+                    markdown=kb_md,
+                    keyboard=keyboard_payload,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
+            else:
+                gid = event.get_group_id() or event.session_id
+                await client.api.post_group_message(
+                    group_openid=gid,
+                    msg_type=2,
+                    markdown=kb_md,
+                    keyboard=keyboard_payload,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
+        except Exception as e:
+            logger.error(f"发送 keyboard 按钮测试失败：{e}")
+
+        event.stop_event()
+        yield
+
+    # alias 同时保留「卡片」和「菜谱卡片」：按钮里填的是 /卡片 菜名，
+    # 若只留「菜谱卡片」按钮就会被填成一条不存在的指令（点了没反应）。
+    @filter.command("card", alias={'卡片', '菜谱卡片'})
     async def card(self, event: AstrMessageEvent):
         """渲染菜谱卡片图片：/卡片 菜名（渲染失败时退化成文本结果）"""
         target = CARD_CMD_PREFIX.sub("", event.message_str).strip()
+        # 整条命令的总计时，最后统一打一条，方便和各子步骤对照
+        cmd_step = f"卡片命令「{target}」"
+        t_total = _step_start(cmd_step)
+
+        t = _step_start("匹配菜名")
+        # 先算一次匹配，拿到「可能还想要的其它菜」；精确命中时没有候选
+        row, best_score, matched = (
+            self._match_dish(target) if self._rows and target else (None, 0.0, [])
+        )
+        candidates = self._candidate_names(best_score, matched, limit=CARD_HINT_LIMIT)
+        _step_end("匹配菜名", t)
+
         png = await self._render_card(target)
         if not png:
             # 渲染不可用（没装 Chrome / 模板缺失 / 菜名没匹配上）时退回文本，不让命令彻底失败
+            t = _step_start("渲染失败，退回文本结果")
             text = self._render(await self._build_reply(target))
+            _step_end("渲染失败，退回文本结果", t)
+            _step_end(cmd_step, t_total)
             yield event.plain_result(text)
             return
+
+        # 首选：QQ 官方平台上发一条 markdown 消息，图片内嵌 + 候选菜做成「指令按钮」。
+        # 这样既保住一条消息，又不会像富媒体那样把 ** 和 > 原样显示出来。
+        if row is not None and self._platform_mode() == MODE_QQ_OFFICIAL:
+            t = _step_start("发送 markdown 卡片（内嵌图 + 按钮）")
+            sent = await self._send_card_markdown(event, png, row, candidates)
+            _step_end("发送 markdown 卡片（内嵌图 + 按钮）", t)
+            if sent:
+                _step_end(cmd_step, t_total)
+                event.stop_event()
+                yield
+                return
+            logger.warning("markdown 卡片没发出去，改用富媒体兜底")
+
+        # 兜底：内嵌图/按钮不可用（非 QQ 官方、上传被拒、版本太旧……）时，
+        # 退回「富媒体图片 + 纯文字提示」，功能不至于丢。
+        # 注意：带图片时适配器会强制走 msg_type=7 并剥掉 markdown 字段，
+        # 所以这里只能用纯文字，不能再塞 ** 和 >。
+        t = _step_start("兜底发送（富媒体图 + 纯文字）")
+        parts: list = [Image.fromFileSystem(png)]
+        plain_hint = self._plain_candidate_hint(candidates)
+        if plain_hint:
+            parts.append(Plain(plain_hint))
         try:
-            await event.send(MessageChain([Image.fromFileSystem(png)]))
+            await event.send(MessageChain(parts))
         except Exception as e:
             logger.error(f"发送菜谱卡片失败：{e}")
+        _step_end("兜底发送（富媒体图 + 纯文字）", t)
+        _step_end(cmd_step, t_total)
         event.stop_event()
         yield
 
@@ -415,32 +631,425 @@ class MyPlugin(Star):
         """把匹配到的菜渲染成 PNG，返回图片路径；任何环节出问题都返回 None。"""
         if not self._rows or not target:
             return None
+        t = _step_start("渲染-重新匹配菜名")
         row, _, _ = self._match_dish(target)
+        _step_end("渲染-重新匹配菜名", t)
         if row is None:
+            logger.info("渲染：没匹配到菜名，跳过渲染")
             return None
 
+        t = _step_start("渲染-加载 render 模块")
         try:
             render_mod = load_render_module()
             render_png = render_mod.render
         except Exception as e:
             logger.error(f"加载 render.py 失败，无法渲染菜谱卡片：{e}")
+            _step_end("渲染-加载 render 模块", t)
             return None
+        _step_end("渲染-加载 render 模块", t)
+
+        t = _step_start("渲染-构造卡片数据")
         data = self.build_card_data(row)
         # 输出到 render 的工作根目录（部署时通常已在数据盘上，如 AstrBot 的 data 目录），
         # 而不是插件目录（避免越写越大）也不是 /tmp（容器里会在 overlay 层）
         out_dir = os.path.join(render_mod.WORK_ROOT, "cards")
         os.makedirs(out_dir, exist_ok=True)
         safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", base_name(str(row[1])))[:40] or "card"
-        png_path = os.path.join(out_dir, f"{safe}.png")
+        png_path = os.path.join(out_dir, f"{safe}{CARD_OUTPUT_EXT}")
+        _step_end("渲染-构造卡片数据", t)
+
         logger.info(f"开始渲染菜谱卡片：{row[1]} -> {png_path}")
+        # 这一步是大头：拉 Chrome、切 DOM、截图；use_cache=True 命中磁盘缓存时会快很多
+        t = _step_start("渲染-出图（含 Chrome，可能命中缓存）")
         try:
             # render 内部会拉 Chrome 子进程，扔到线程里避免阻塞事件循环
             # use_cache=True：同一道菜重复查询直接复用上次的 PNG
             await asyncio.to_thread(render_png, data, png_path, CARD_RENDER_SCALE, True)
         except Exception as e:
             logger.error(f"渲染菜谱卡片失败：{e}")
+            _step_end("渲染-出图（含 Chrome，可能命中缓存）", t)
             return None
-        return png_path if os.path.isfile(png_path) else None
+        _step_end("渲染-出图（含 Chrome，可能命中缓存）", t)
+
+        if not os.path.isfile(png_path):
+            logger.error(f"渲染结束但没生成文件：{png_path}")
+            return None
+        return png_path
+
+    # ---- QQ 官方：一条消息里「内嵌图 + 候选菜指令按钮」----
+
+    def _get_qq_client(self, event: AstrMessageEvent):
+        """拿到 QQ 官方适配器的 botpy client；拿不到就返回 None。
+
+        AstrBot 的消息链里没有 Keyboard 组件、适配器发送时也不读 keyboard，
+        所以要发按钮必须绕过 message chain，直接调 botpy 的接口。
+        """
+        get_inst = getattr(self.context, "get_platform_inst", None)
+        if get_inst is None:
+            return None
+        adapter = get_inst(event.get_platform_id())
+        if adapter is None:
+            return None
+        get_client = getattr(adapter, "get_client", None)
+        return get_client() if get_client else None
+
+    async def _send_card_markdown(
+        self,
+        event: AstrMessageEvent,
+        png_path: str,
+        row: list,
+        candidates: list,
+    ) -> bool:
+        """用一条 markdown 消息发送卡片：图片内嵌 + 候选菜做成指令按钮。
+
+        成功返回 True；任何环节不行都返回 False，由调用方退回富媒体方案。
+        """
+        t = _step_start("发送-获取 QQ client")
+        client = self._get_qq_client(event)
+        _step_end("发送-获取 QQ client", t)
+        if client is None:
+            logger.error("发送：拿不到 QQ client，改用兜底方案")
+            return False
+
+        # 素材引用会缓存复用（省掉 prepare/PUT/complete 约 1.5s）。
+        # 但缓存可能已过期（官方 90 天滑动过期），所以发送失败时丢缓存、重新上传再试一次。
+        for attempt in (1, 2):
+            step_up = f"发送-取素材引用（第 {attempt} 次）"
+            t = _step_start(step_up)
+            media = await self._upload_card_image(client, png_path, allow_cache=attempt == 1)
+            _step_end(step_up, t)
+            if not media:
+                return False
+            try:
+                t = _step_start("发送-组装 markdown + 按钮")
+                content = self._card_markdown(row, png_path, media["url"], candidates)
+                keyboard = self._card_keyboard(candidates)
+                _step_end("发送-组装 markdown + 按钮", t)
+
+                t = _step_start("发送-调接口发消息（markdown + 按钮）")
+                await self._post_markdown(event, client, content, keyboard)
+                _step_end("发送-调接口发消息（markdown + 按钮）", t)
+                return True
+            except Exception as e:
+                logger.error(f"发送菜谱 markdown 卡片失败（第 {attempt} 次）：{e}")
+                if attempt == 2:
+                    return False
+                # 大概率是缓存里的 qqbot-media 引用失效了，丢掉它换新的重试
+                t = _step_start("发送-丢弃失效的素材缓存")
+                await self._forget_media(client, media.get("digest"))
+                _step_end("发送-丢弃失效的素材缓存", t)
+        return False
+
+    @staticmethod
+    def _image_size(path: str) -> tuple[int, int] | None:
+        """读图片宽高（PNG 走 IHDR，JPEG 走 SOF 段），读不出返回 None。"""
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+
+        # PNG：IHDR 固定在第 16/20 字节
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+            return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+        # JPEG：扫到 SOF 段才有尺寸（SOF0..SOF15，但 C4/C8/CC 不是 SOF）
+        if data[:2] != b"\xff\xd8":
+            return None
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(data[i + 5 : i + 7], "big")
+                width = int.from_bytes(data[i + 7 : i + 9], "big")
+                return width, height
+            seg_len = int.from_bytes(data[i + 2 : i + 4], "big")
+            if seg_len < 2:
+                return None
+            i += 2 + seg_len
+        return None
+
+    def _card_markdown(
+        self, row: list, png_path: str, media_url: str, candidates: list
+    ) -> str:
+        """拼 markdown 正文：标题 + 内嵌图片 + 候选菜提示（按钮挂在消息底部）。"""
+        title = f"**[{row[0]}] {row[1]}**"
+        size = self._image_size(png_path)
+        alt = str(row[1]).replace("[", "(").replace("]", ")")
+        # 宽高可选，但显式写出来可以让客户端按原尺寸渲染、避免二次缩放
+        if size:
+            image = f"![{alt} #{size[0]}px #{size[1]}px]({media_url})"
+        else:
+            image = f"![{alt}]({media_url})"
+        lines = [title, "", image]
+        if candidates:
+            lines += ["", "**或是其他的菜？**"]
+        return "\n".join(lines)
+
+    def _card_keyboard(self, candidates: list) -> dict | None:
+        """把候选菜名做成「指令按钮」（action.type=2：点击后自动在输入框插入 @bot + data）。"""
+        if not candidates:
+            return None
+        buttons = []
+        for index, name in enumerate(candidates):
+            label = name
+            if len(label) > CARD_BUTTON_LABEL_MAX:
+                label = label[: CARD_BUTTON_LABEL_MAX - 1] + "…"
+            buttons.append(
+                {
+                    "id": f"dish{index}",
+                    "render_data": {
+                        "label": label,
+                        "visited_label": label,
+                        "style": 1,
+                    },
+                    "action": {
+                        "type": 2,  # 指令按钮：自动在输入框插入 @bot + data
+                        "permission": {"type": 2},  # 所有人可点
+                        "data": f"/卡片 {name}",
+                        "unsupport_tips": "当前QQ版本不支持按钮，请升级",
+                    },
+                }
+            )
+        rows = [
+            {"buttons": buttons[i : i + CARD_BUTTON_PER_ROW]}
+            for i in range(0, len(buttons), CARD_BUTTON_PER_ROW)
+        ][:CARD_BUTTON_MAX_ROWS]
+        return {"content": {"rows": rows}} if rows else None
+
+    async def _post_markdown(
+        self,
+        event: AstrMessageEvent,
+        client,
+        content: str,
+        keyboard: dict | None,
+    ) -> None:
+        """直接调 botpy 发一条 markdown 消息（可选挂按钮）。"""
+        kwargs: dict = {
+            "msg_type": 2,  # markdown
+            "markdown": {"content": content},
+            # 被动回复要带 msg_id；同一 msg_id 重复用同一个 msg_seq 会失败，所以随机取
+            "msg_id": getattr(event.message_obj, "message_id", None),
+            "msg_seq": random.randint(1, 10000),
+        }
+        if keyboard:
+            kwargs["keyboard"] = keyboard
+        if event.is_private_chat():
+            await client.api.post_c2c_message(openid=event.session_id, **kwargs)
+        else:
+            # 群聊时适配器把 group_openid 存在 group_id 上，取不到再退回 session_id
+            gid = event.get_group_id() or event.session_id
+            await client.api.post_group_message(group_openid=gid, **kwargs)
+
+    async def _upload_card_image(
+        self, client, png_path: str, allow_cache: bool = True
+    ) -> dict | None:
+        """取得卡片图在素材库的引用，返回 {url, image_id, digest}。
+
+        url 形如 qqbot-media://image/v1/...，可直接写进 markdown 内嵌图。
+        已上传过的相同内容会直接复用缓存（省掉 prepare/PUT/complete 约 1.5s）；
+        没命中则走官方三段式：prepare → PUT 直传 → complete。
+        """
+        t = _step_start("素材-读取图片文件")
+        try:
+            data = await asyncio.to_thread(self._read_bytes, png_path)
+        except OSError as e:
+            logger.error(f"读取卡片图片失败：{e}")
+            _step_end("素材-读取图片文件", t)
+            return None
+        size_ms = _step_end("素材-读取图片文件", t)
+        if not data:
+            return None
+        logger.info(f"[计时] 图片大小 {len(data) / 1024:.1f} KB，读取耗时 {size_ms}ms")
+        if len(data) > CARD_MEDIA_MAX_BYTES:
+            logger.error(f"卡片图片超过素材上限（{len(data)} 字节），改用富媒体发送")
+            return None
+
+        # 同一张图（内容哈希相同）的引用可以反复用，不必每次重传
+        digest = hashlib.sha256(data).hexdigest()
+        if allow_cache:
+            cached = self._media_cache.get(digest)
+            if cached:
+                # 命中了就挪到末尾，表示“最近用过”，淘汰时优先删早的
+                self._media_cache.move_to_end(digest)
+                logger.info("[计时] 素材命中缓存，跳过上传")
+                return {**cached, "digest": digest}
+            logger.info("[计时] 素材没命中缓存，需要上传")
+
+        # 延迟导入：botpy / aiohttp 在 AstrBot 里一定有，但本地静态检查环境未必有
+        import importlib
+
+        t = _step_start("素材-准备依赖（botpy/aiohttp）")
+        try:
+            route_cls = importlib.import_module("botpy.http").Route
+            aiohttp = importlib.import_module("aiohttp")
+        except Exception as e:
+            logger.error(f"素材上传依赖缺失：{e}")
+            _step_end("素材-准备依赖（botpy/aiohttp）", t)
+            return None
+        _step_end("素材-准备依赖（botpy/aiohttp）", t)
+
+        http = getattr(getattr(client, "api", None), "_http", None)
+        if http is None:
+            logger.error("素材：拿不到 botpy 的 http 对象")
+            return None
+
+        try:
+            t = _step_start("素材-prepare 申请上传（网络）")
+            prepared = await http.request(
+                route_cls("POST", "/v2/media-images/prepare"),
+                json={
+                    "file_name": CARD_MEDIA_FILE_NAME,
+                    "file_size": len(data),
+                    "content_type": CARD_MEDIA_CONTENT_TYPE,
+                    # 官方要求同时给 MD5 与 SHA1
+                    "md5": hashlib.md5(data).hexdigest(),
+                    "sha1": hashlib.sha1(data).hexdigest(),
+                },
+            )
+            _step_end("素材-prepare 申请上传（网络）", t)
+            upload_id = prepared.get("upload_id")
+            presigned = prepared.get("presigned_url")
+            if not upload_id or not presigned:
+                logger.error(f"申请素材上传失败：{prepared}")
+                return None
+
+            # PUT 预签名 URL：不能带 botpy 的 Authorization 头，否则 COS 会因签名不符拒绝
+            # 这一步把图片二进制直传到对象存储，上传带宽差的时候会明显耗时
+            t = _step_start("素材-PUT 直传二进制（网络）")
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    presigned,
+                    data=data,
+                    headers={"Content-Type": CARD_MEDIA_CONTENT_TYPE},
+                ) as resp:
+                    if resp.status >= 300:
+                        _step_end("素材-PUT 直传二进制（网络）", t)
+                        logger.error(f"上传素材失败：HTTP {resp.status}")
+                        return None
+                    # COS 的 ETag 就是文件 MD5（带引号）
+                    etag = (resp.headers.get("ETag") or "").strip('"')
+            _step_end("素材-PUT 直传二进制（网络）", t)
+
+            t = _step_start("素材-complete 完成上传（网络）")
+            completed = await http.request(
+                route_cls("POST", "/v2/media-images/complete"),
+                json={"upload_id": upload_id, "md5": etag},
+            )
+            _step_end("素材-complete 完成上传（网络）", t)
+            url = completed.get("url")
+            if not url:
+                logger.error(f"完成素材上传失败：{completed}")
+                return None
+            entry = {"url": url, "image_id": completed.get("image_id")}
+            # 写缓存；超限时把最久没用的那几条删掉，避免撞 100 张配额
+            t = _step_start("素材-写入引用缓存")
+            await self._remember_media(client, digest, entry)
+            _step_end("素材-写入引用缓存", t)
+            return {**entry, "digest": digest}
+        except Exception as e:
+            logger.error(f"上传卡片图片到素材库失败：{e}")
+            return None
+
+    def _media_cache_path(self) -> str:
+        """素材缓存的落盘路径：优先放 render 的数据目录（通常已在数据盘），退化为插件目录。"""
+        try:
+            root = load_render_module().WORK_ROOT
+        except Exception:
+            root = PLUGIN_DIR
+        return os.path.join(root, MEDIA_CACHE_FILE)
+
+    def _load_media_cache(self) -> None:
+        """把上次落盘的素材引用读回内存；文件不存在或坏了都只记日志，按空缓存继续。"""
+        path = self._media_cache_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.warning(f"读取素材缓存失败（忽略，按空缓存继续）：{e}")
+            return
+
+        if not isinstance(saved, dict):
+            return
+        for digest, entry in saved.items():
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url")
+            if url:
+                self._media_cache[digest] = {"url": url, "image_id": entry.get("image_id")}
+        if self._media_cache:
+            logger.info(
+                f"素材引用缓存已加载 {len(self._media_cache)} 条"
+                f"（这些菜不用重新上传，直接省约 1.45s）"
+            )
+
+    def _save_media_cache(self) -> None:
+        """把素材缓存写盘（先写临时文件再替换，避免半个文件）。失败不影响发送。"""
+        path = self._media_cache_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._media_cache, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"写入素材缓存失败（不影响发送）：{e}")
+
+    async def _remember_media(self, client, digest: str, entry: dict) -> None:
+        """把素材引用记进 LRU 缓存；超出上限时删掉最久没用的，释放配额。"""
+        if not digest:
+            return
+        self._media_cache[digest] = entry
+        self._media_cache.move_to_end(digest)
+        while len(self._media_cache) > CARD_MEDIA_CACHE_MAX:
+            _, old = self._media_cache.popitem(last=False)
+            logger.info(f"[计时] 素材缓存超限，删掉最久没用的一条：{old.get('image_id')}")
+            await self._delete_card_image(client, old.get("image_id"))
+        self._save_media_cache()
+
+    async def _forget_media(self, client, digest) -> None:
+        """丢弃一条素材缓存（引用可能已过期），并顺便从平台删除。"""
+        if not digest:
+            return
+        old = self._media_cache.pop(digest, None)
+        self._save_media_cache()
+        if old:
+            await self._delete_card_image(client, old.get("image_id"))
+
+    async def _delete_card_image(self, client, image_id) -> None:
+        """删除素材释放配额（上限 100 张）；失败只记日志，不影响发送结果。"""
+        if not image_id:
+            return
+        import importlib
+
+        try:
+            route_cls = importlib.import_module("botpy.http").Route
+            http = getattr(getattr(client, "api", None), "_http", None)
+            if http is None:
+                return
+            await http.request(
+                route_cls("DELETE", f"/v2/media-images/{image_id}/delete")
+            )
+        except Exception as e:
+            logger.warning(f"删除卡片素材失败（不影响消息）：{e}")
+
+    @staticmethod
+    def _read_bytes(path: str) -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _plain_candidate_hint(self, candidates: list) -> str:
+        """兜底用的纯文字候选提示（富媒体消息里 markdown 不生效，只能给纯文本）。"""
+        if not candidates:
+            return ""
+        return "或是其他的菜？\n" + " ".join(candidates)
+
+    # ---- /卡片 具体实现结束 ----
 
     @filter.command("recipe", alias={'菜谱', '食谱'})
     async def cuisine(self, event: AstrMessageEvent):
@@ -514,10 +1123,41 @@ class MyPlugin(Star):
         if row[10] != "":
             lines.append(str(row[10]))
         # 只有一项匹配时没有「其他的菜」可列，不输出这一行
-        if best_score < 1 and len(matched) > 1:
-            lines.append("> **或是其他的菜？**")
-            lines.append("> " + " ".join(self._names[pos] for _, pos in matched[1:]))
+        hint = self._candidate_hint(best_score, matched)
+        if hint:
+            lines.append(hint)
         return "\n".join(lines)
+
+    def _candidate_names(self, best_score: float, matched: list, limit: int | None = None) -> list:
+        """取出「可能还想要的其它菜」的菜名列表；没有候选时返回空列表。
+
+        和 _candidate_hint 同一套判定：精确命中（1.0）或只有一个结果时不给候选。
+        卡片命令要用菜名去生成按钮，所以单独返回 list 而不是拼好的文字。
+        """
+        if best_score >= 1 or len(matched) < 2:
+            return []
+        names = [str(self._names[pos]) for _, pos in matched[1:]]
+        return names[:limit] if limit is not None else names
+
+    def _candidate_hint(self, best_score: float, matched: list, limit: int | None = None) -> str:
+        """把「可能还想要的其它菜」整理成一段带 Markdown 的文字；没有候选时返回空串。
+
+        只在模糊匹配（best_score < 1）且确实有别的候选时才输出，精确命中不啰嗦。
+        返回的是引用块形式，和文本回复里的「或是其他的菜？」完全一致：
+            > **或是其他的菜？**
+            > 甜瓜花茶 甜饼果茶 馥郁瓜果茶
+
+        limit 限制列出多少个（卡片消息里防止刷屏），None 表示全列。
+        """
+        if best_score >= 1 or len(matched) < 2:
+            return ""
+        names = [self._names[pos] for _, pos in matched[1:]]
+        if limit is not None and len(names) > limit:
+            names = names[:limit]
+            tail = " 等"
+        else:
+            tail = ""
+        return "> **或是其他的菜？**\n> " + " ".join(names) + tail
 
     def _match_dish(self, target: str) -> tuple[list | None, float, list]:
         """模糊匹配菜名，返回 (行数据, 匹配分, [(分, 下标)...])；没匹配上时行是 None。

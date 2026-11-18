@@ -39,6 +39,33 @@ W, H = 911, 736
 
 USE_PLAYWRIGHT = False
 
+# ---- 计时日志 ----
+# 插件加载本模块后会把这个换成 AstrBot 的插件 logger（见 main.load_render_module），
+# 这样计时能出现在机器人日志里；直接用 `python render.py` 跑时退回 print
+# （不能用标准 logging：INFO 级别默认没有 handler，什么都不显示）。
+LOGGER = None
+
+
+def _log(msg: str) -> None:
+    if LOGGER is not None:
+        LOGGER.info(msg)
+    else:
+        print(msg)
+
+
+def _ts(step: str) -> float:
+    """记一条「步骤开始」，返回起始时间戳。"""
+    # 标记用纯 ASCII：Windows 的 GBK 控制台编不了 ▶ 之类的字符（会直接抛错）
+    _log(f"[计时] >> {step} 开始")
+    return time.perf_counter()
+
+
+def _te(step: str, started: float) -> int:
+    """记一条「步骤结束 + 耗时」，返回毫秒数。"""
+    ms = int((time.perf_counter() - started) * 1000)
+    _log(f"[计时] << {step} 结束，用时 {ms}ms")
+    return ms
+
 BROWSERS = [
     os.environ.get("CHROME_PATH", ""),
     # Linux / 容器（Debian 的 chromium、Ubuntu 的 snap、以及 Chrome 官方包）
@@ -188,6 +215,18 @@ USE_RESIDENT = True           # True  = 常驻 Chrome：首次 ~1.2s 启动，�
                               # 内存代价约 490MB 工作集，可用内存充足时建议开着。
 _CDP_LOCK = threading.RLock()
 _CDP = None                   # 当前 _ChromeCDP 实例
+
+# ---- 截图输出格式 ----
+# 卡片背景是整幅不透明的插画，不需要 alpha 通道，所以 JPEG 比 PNG 划算得多。
+# 同一张卡片实测（Windows，0.8 倍）：
+#   png       86ms  512.9KB
+#   jpeg 95   50ms  107.3KB   ← 体积降到 1/4.8，编码还快 1.7 倍
+#   webp 95   79ms   62.0KB   （更小但编码更慢，ARM 上不占优）
+# 体积小还连带加速素材上传和消息下发（平台要转存/分发这张图）。
+SHOT_FORMAT = "jpeg"          # png / jpeg / webp
+SHOT_QUALITY = 95             # 仅 jpeg / webp 生效
+# 格式 → 文件扩展名（写文件、缓存都要跟着变）
+_SHOT_SUFFIX = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 
 # 降内存：单渲染进程 + GPU 进程内联。实测 590/253 -> 489/208 MB（约 -18%），
 # 连渲 15 张与默认参数的输出逐像素一致。
@@ -512,8 +551,12 @@ class _ChromeCDP:
             self._scale = scale
 
     def _screenshot(self, png_path):
-        # optimizeForSpeed 编不出更小的文件，但快一倍（152ms -> 70ms），图片仍无损
-        shot = self._send("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})
+        # optimizeForSpeed：PNG 下编不出更小的文件但快一倍（152ms -> 70ms），图片仍无损。
+        # JPEG/WebP 还要带 quality，否则 Chrome 用默认值（体积偏大）。
+        params = {"format": SHOT_FORMAT, "optimizeForSpeed": True}
+        if SHOT_FORMAT in ("jpeg", "webp"):
+            params["quality"] = SHOT_QUALITY
+        shot = self._send("Page.captureScreenshot", params)
         with open(png_path, "wb") as f:
             f.write(base64.b64decode(shot["data"]))
 
@@ -535,10 +578,14 @@ class _ChromeCDP:
 
     def shoot(self, html, png_path, scale):
         """html = 已填好的完整文档。优先只换 body（~83ms），否则整页导航（~160ms）。"""
+        t = _ts("CDP-设置倍数 + 加载骨架页")
         self._set_scale(scale)
         self._load_base()
+        _te("CDP-设置倍数 + 加载骨架页", t)
 
         body = _body_inner(html)
+        # 换 DOM 后图片要重新加载/解码、字体要重新应用，这一般是截图前的大头
+        t = _ts("CDP-替换 DOM 并等图片字体就绪")
         try:
             # 只替换 body：省掉重新加载页面、重新解析 CSS/字体的开销
             self._evaluate(_SWAP_JS % json.dumps(body), await_promise=True)
@@ -556,8 +603,52 @@ class _ChromeCDP:
                 os.remove(p)
             except OSError:
                 pass
+        _te("CDP-替换 DOM 并等图片字体就绪", t)
 
+        # 截图 + 图像编码：ARM 上这一项可能比自己以为的贵得多
+        t = _ts("CDP-截图并编码图像")
         self._screenshot(png_path)
+        _te("CDP-截图并编码图像", t)
+
+
+def _ensure_cdp(scale):
+    """确保常驻 Chrome 可用（必要的启动/重建），返回实例。调用方需持有 _CDP_LOCK。"""
+    global _CDP
+    # 进程挂了或倍数变了才重建；否则一直复用同一个 Chrome
+    if _CDP is not None and (not _CDP.alive() or _CDP.scale != scale):
+        t = _ts("render-关闭旧的常驻 Chrome")
+        _CDP.close()
+        _CDP = None
+        _te("render-关闭旧的常驻 Chrome", t)
+    if _CDP is None:
+        t = _ts("render-启动常驻 Chrome（首次很慢）")
+        _CDP = _ChromeCDP(find_browser(), scale)
+        _CDP.start()
+        _te("render-启动常驻 Chrome（首次很慢）", t)
+    else:
+        _log("[计时]   复用已有的常驻 Chrome，无需启动")
+    return _CDP
+
+
+def prewarm(scale: float = 1.0) -> bool:
+    """提前把常驻 Chrome 和模板骨架页准备好。
+
+    目的是把“冷启动 6~7 秒”从用户的第一次请求里挤出去：插件加载完后
+    在后台线程调一次，之后所有渲染都直接复用。失败只返回 False（按需启动仍然能用）。
+    """
+    if USE_PLAYWRIGHT or not USE_RESIDENT:
+        return False
+    with _CDP_LOCK:
+        t = _ts("预热-常驻 Chrome + 骨架页就绪")
+        try:
+            cdp = _ensure_cdp(scale)
+            cdp._load_base()  # noqa: SLF001  预热时顺便把模板骨架也加载好
+            _te("预热-常驻 Chrome + 骨架页就绪", t)
+            return True
+        except Exception as e:
+            _log("[计时] 预热失败（不影响按需启动）：%r" % (e,))
+            _te("预热-常驻 Chrome + 骨架页就绪", t)
+            return False
 
 
 def _render_cdp(html, png_path, scale):
@@ -570,14 +661,10 @@ def _render_cdp(html, png_path, scale):
 
     with _CDP_LOCK:
         try:
-            # 进程挂了或倍数变了才重建；否则一直复用同一个 Chrome
-            if _CDP is not None and (not _CDP.alive() or _CDP.scale != scale):
-                _CDP.close()
-                _CDP = None
-            if _CDP is None:
-                _CDP = _ChromeCDP(find_browser(), scale)
-                _CDP.start()
-            _CDP.shoot(html, png_path, scale)
+            cdp = _ensure_cdp(scale)
+            t = _ts("render-CDP 换 DOM + 截图")
+            cdp.shoot(html, png_path, scale)
+            _te("render-CDP 换 DOM + 截图", t)
             return True
         except Exception as e:
             print("常驻 Chrome 出图失败，回落临时会话：%r" % (e,), file=sys.stderr)
@@ -704,11 +791,20 @@ def _cache_key(html, scale):
     h = hashlib.sha256()
     h.update(html.encode("utf-8"))
     h.update(("|scale=%s" % scale).encode("utf-8"))
+    # 截图格式/质量也要进 key：换了格式后旧缓存必须失效，
+    # 否则会把 PNG 缓存当成 .jpg 直接发出去（文件内容与扩展名不符）。
+    h.update(("|fmt=%s|q=%s" % (SHOT_FORMAT, SHOT_QUALITY)).encode("utf-8"))
     return h.hexdigest()[:32]
 
 
+def _cache_path(html, scale):
+    return os.path.join(
+        _CACHE_DIR, _cache_key(html, scale) + _SHOT_SUFFIX.get(SHOT_FORMAT, ".png")
+    )
+
+
 def _cache_get(html, scale):
-    p = os.path.join(_CACHE_DIR, _cache_key(html, scale) + ".png")
+    p = _cache_path(html, scale)
     if os.path.isfile(p) and os.path.getsize(p) > 0:
         return p
     return None
@@ -717,7 +813,7 @@ def _cache_get(html, scale):
 def _cache_put(html, scale, png_path, touch=True):
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
-        dst = os.path.join(_CACHE_DIR, _cache_key(html, scale) + ".png")
+        dst = _cache_path(html, scale)
         if os.path.abspath(dst) != os.path.abspath(png_path):
             shutil.copyfile(png_path, dst)
         if touch:
@@ -758,28 +854,43 @@ def render(data=None, png_path=None, scale: float = 1, use_cache: bool = False):
     png_path = os.path.abspath(png_path)      # Chrome 拿到相对路径会写到别处，必须转绝对路径
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
 
+    t = _ts("render-把数据填进 HTML 模板")
     html = fill(data or EXAMPLE)
+    _te("render-把数据填进 HTML 模板", t)
 
     # 命中缓存就直接拷贝，不碰浏览器
     if use_cache:
+        t = _ts("render-查磁盘缓存")
         hit = _cache_get(html, scale)
+        _te("render-查磁盘缓存", t)
         if hit:
+            t = _ts("render-拷贝缓存文件")
             if os.path.abspath(hit) != png_path:
                 shutil.copyfile(hit, png_path)
+            _te("render-拷贝缓存文件", t)
+            _log("[计时] 命中缓存，没碰浏览器")
             print("已命中缓存 ->", png_path)
             return png_path
+        _log("[计时] 没命中缓存，需要真渲染")
 
     done = False
     if not USE_PLAYWRIGHT:
         # 1) 常驻（打开了才走）
         if USE_RESIDENT:
+            t = _ts("render-常驻 CDP 出图")
             done = _render_cdp(html, png_path, scale)
+            _te("render-常驻 CDP 出图", t)
+            _log(f"[计时] 常驻 CDP 结果：{'成功' if done else '失败，回落下一级'}")
         # 2) 临时 CDP 会话：比 --screenshot 快一倍以上
         if not done:
+            t = _ts("render-一次性 CDP 出图")
             done = _render_cdp_oneshot(html, png_path, scale)
+            _te("render-一次性 CDP 出图", t)
+            _log(f"[计时] 一次性 CDP 结果：{'成功' if done else '失败，回落下一级'}")
 
     # 3) 最后回落：写中间 html 后走 --screenshot / playwright
     if not done:
+        t = _ts("render-兜底出图（--screenshot / playwright）")
         # 唯一文件名：并发时共用一个 _job.html 会互相覆盖
         stem = "_job_%s" % uuid.uuid4().hex[:10]
         try:
@@ -800,9 +911,12 @@ def render(data=None, png_path=None, scale: float = 1, use_cache: bool = False):
         finally:
             if os.path.exists(html_path):
                 os.remove(html_path)
+        _te("render-兜底出图（--screenshot / playwright）", t)
 
     if use_cache and os.path.isfile(png_path):
+        t = _ts("render-写磁盘缓存")
         _cache_put(html, scale, png_path)
+        _te("render-写磁盘缓存", t)
     print("已渲染 ->", png_path)
     return png_path
 
