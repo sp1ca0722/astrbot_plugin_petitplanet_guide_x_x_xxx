@@ -39,33 +39,6 @@ W, H = 911, 736
 
 USE_PLAYWRIGHT = False
 
-# ---- 计时日志 ----
-# 插件加载本模块后会把这个换成 AstrBot 的插件 logger（见 main.load_render_module），
-# 这样计时能出现在机器人日志里；直接用 `python render.py` 跑时退回 print
-# （不能用标准 logging：INFO 级别默认没有 handler，什么都不显示）。
-LOGGER = None
-
-
-def _log(msg: str) -> None:
-    if LOGGER is not None:
-        LOGGER.info(msg)
-    else:
-        print(msg)
-
-
-def _ts(step: str) -> float:
-    """记一条「步骤开始」，返回起始时间戳。"""
-    # 标记用纯 ASCII：Windows 的 GBK 控制台编不了 ▶ 之类的字符（会直接抛错）
-    _log(f"[计时] >> {step} 开始")
-    return time.perf_counter()
-
-
-def _te(step: str, started: float) -> int:
-    """记一条「步骤结束 + 耗时」，返回毫秒数。"""
-    ms = int((time.perf_counter() - started) * 1000)
-    _log(f"[计时] << {step} 结束，用时 {ms}ms")
-    return ms
-
 BROWSERS = [
     os.environ.get("CHROME_PATH", ""),
     # Linux / 容器（Debian 的 chromium、Ubuntu 的 snap、以及 Chrome 官方包）
@@ -578,14 +551,11 @@ class _ChromeCDP:
 
     def shoot(self, html, png_path, scale):
         """html = 已填好的完整文档。优先只换 body（~83ms），否则整页导航（~160ms）。"""
-        t = _ts("CDP-设置倍数 + 加载骨架页")
         self._set_scale(scale)
         self._load_base()
-        _te("CDP-设置倍数 + 加载骨架页", t)
 
         body = _body_inner(html)
         # 换 DOM 后图片要重新加载/解码、字体要重新应用，这一般是截图前的大头
-        t = _ts("CDP-替换 DOM 并等图片字体就绪")
         try:
             # 只替换 body：省掉重新加载页面、重新解析 CSS/字体的开销
             self._evaluate(_SWAP_JS % json.dumps(body), await_promise=True)
@@ -603,12 +573,9 @@ class _ChromeCDP:
                 os.remove(p)
             except OSError:
                 pass
-        _te("CDP-替换 DOM 并等图片字体就绪", t)
 
         # 截图 + 图像编码：ARM 上这一项可能比自己以为的贵得多
-        t = _ts("CDP-截图并编码图像")
         self._screenshot(png_path)
-        _te("CDP-截图并编码图像", t)
 
 
 def _ensure_cdp(scale):
@@ -616,17 +583,11 @@ def _ensure_cdp(scale):
     global _CDP
     # 进程挂了或倍数变了才重建；否则一直复用同一个 Chrome
     if _CDP is not None and (not _CDP.alive() or _CDP.scale != scale):
-        t = _ts("render-关闭旧的常驻 Chrome")
         _CDP.close()
         _CDP = None
-        _te("render-关闭旧的常驻 Chrome", t)
     if _CDP is None:
-        t = _ts("render-启动常驻 Chrome（首次很慢）")
         _CDP = _ChromeCDP(find_browser(), scale)
         _CDP.start()
-        _te("render-启动常驻 Chrome（首次很慢）", t)
-    else:
-        _log("[计时]   复用已有的常驻 Chrome，无需启动")
     return _CDP
 
 
@@ -639,15 +600,11 @@ def prewarm(scale: float = 1.0) -> bool:
     if USE_PLAYWRIGHT or not USE_RESIDENT:
         return False
     with _CDP_LOCK:
-        t = _ts("预热-常驻 Chrome + 骨架页就绪")
         try:
             cdp = _ensure_cdp(scale)
             cdp._load_base()  # noqa: SLF001  预热时顺便把模板骨架也加载好
-            _te("预热-常驻 Chrome + 骨架页就绪", t)
             return True
-        except Exception as e:
-            _log("[计时] 预热失败（不影响按需启动）：%r" % (e,))
-            _te("预热-常驻 Chrome + 骨架页就绪", t)
+        except Exception:
             return False
 
 
@@ -662,9 +619,7 @@ def _render_cdp(html, png_path, scale):
     with _CDP_LOCK:
         try:
             cdp = _ensure_cdp(scale)
-            t = _ts("render-CDP 换 DOM + 截图")
             cdp.shoot(html, png_path, scale)
-            _te("render-CDP 换 DOM + 截图", t)
             return True
         except Exception as e:
             print("常驻 Chrome 出图失败，回落临时会话：%r" % (e,), file=sys.stderr)
@@ -854,43 +809,28 @@ def render(data=None, png_path=None, scale: float = 1, use_cache: bool = False):
     png_path = os.path.abspath(png_path)      # Chrome 拿到相对路径会写到别处，必须转绝对路径
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
 
-    t = _ts("render-把数据填进 HTML 模板")
     html = fill(data or EXAMPLE)
-    _te("render-把数据填进 HTML 模板", t)
 
     # 命中缓存就直接拷贝，不碰浏览器
     if use_cache:
-        t = _ts("render-查磁盘缓存")
         hit = _cache_get(html, scale)
-        _te("render-查磁盘缓存", t)
         if hit:
-            t = _ts("render-拷贝缓存文件")
             if os.path.abspath(hit) != png_path:
                 shutil.copyfile(hit, png_path)
-            _te("render-拷贝缓存文件", t)
-            _log("[计时] 命中缓存，没碰浏览器")
             print("已命中缓存 ->", png_path)
             return png_path
-        _log("[计时] 没命中缓存，需要真渲染")
 
     done = False
     if not USE_PLAYWRIGHT:
         # 1) 常驻（打开了才走）
         if USE_RESIDENT:
-            t = _ts("render-常驻 CDP 出图")
             done = _render_cdp(html, png_path, scale)
-            _te("render-常驻 CDP 出图", t)
-            _log(f"[计时] 常驻 CDP 结果：{'成功' if done else '失败，回落下一级'}")
         # 2) 临时 CDP 会话：比 --screenshot 快一倍以上
         if not done:
-            t = _ts("render-一次性 CDP 出图")
             done = _render_cdp_oneshot(html, png_path, scale)
-            _te("render-一次性 CDP 出图", t)
-            _log(f"[计时] 一次性 CDP 结果：{'成功' if done else '失败，回落下一级'}")
 
     # 3) 最后回落：写中间 html 后走 --screenshot / playwright
     if not done:
-        t = _ts("render-兜底出图（--screenshot / playwright）")
         # 唯一文件名：并发时共用一个 _job.html 会互相覆盖
         stem = "_job_%s" % uuid.uuid4().hex[:10]
         try:
@@ -911,12 +851,9 @@ def render(data=None, png_path=None, scale: float = 1, use_cache: bool = False):
         finally:
             if os.path.exists(html_path):
                 os.remove(html_path)
-        _te("render-兜底出图（--screenshot / playwright）", t)
 
     if use_cache and os.path.isfile(png_path):
-        t = _ts("render-写磁盘缓存")
         _cache_put(html, scale, png_path)
-        _te("render-写磁盘缓存", t)
     print("已渲染 ->", png_path)
     return png_path
 
