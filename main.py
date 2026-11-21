@@ -7,6 +7,7 @@ import re
 import time
 import unicodedata
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 import pandas as pd
@@ -103,6 +104,11 @@ COMBO_CMD_PREFIX = re.compile(
 CARD_CMD_PREFIX = re.compile(
     r"^\s*/?\s*(?:card|菜谱卡片|卡片)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
 )
+
+# 开服倒计时：固定按北京时间（UTC+8）算，不依赖服务器时区（容器里常是 UTC）
+SERVER_OPEN_AT = datetime(2026, 12, 4, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+# 提示还剩不到一天时精确到时分秒，否则只报天数
+COUNTDOWN_SECONDS_PER_DAY = 24 * 60 * 60
 
 # 平台模式（_conf_schema.json 里的 platform_mode）：只有 QQ 官方机器人渲染 Markdown
 MODE_QQ_OFFICIAL = "qq_official"
@@ -248,7 +254,20 @@ def strip_markdown(text: str) -> str:
     return text
 
 
-@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0")
+def build_countdown_text(now: datetime | None = None) -> str:
+    """生成开服倒计时文案：不足 24 小时精确到时分秒，否则只报天数。"""
+    now = now or datetime.now(SERVER_OPEN_AT.tzinfo)
+    left = int((SERVER_OPEN_AT - now).total_seconds())
+    if left <= 0:
+        return "**星布谷地已经开服啦**"
+    if left < COUNTDOWN_SECONDS_PER_DAY:
+        hours, rem = divmod(left, 3600)
+        minutes, seconds = divmod(rem, 60)
+        return f"**距离星布谷地开服还有**\n**{hours}**小时**{minutes}**分**{seconds}**秒"
+    return f"**距离星布谷地开服还有**\n**{left // COUNTDOWN_SECONDS_PER_DAY}**天"
+
+
+@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.1")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -450,6 +469,11 @@ class MyPlugin(Star):
         target = COMBO_CMD_PREFIX.sub("", event.message_str).strip()
         text = self._render(self._build_combo_reply(target))
         yield event.plain_result(text)
+
+    @filter.command("countdown", alias={'倒计时'})
+    async def countdown(self, event: AstrMessageEvent):
+        """开服倒计时：/倒计时"""
+        yield event.plain_result(self._render(build_countdown_text()))
 
     @filter.command("imagetest", alias={'图片测试'})
     async def imagetest(self, event: AstrMessageEvent):
@@ -1081,6 +1105,8 @@ class MyPlugin(Star):
             "- 返回这道菜的食材和做法\n\n"
             "`/卡片 菜名`(可模糊搜索)\n"
             "- 把这道菜渲染成图片卡片\n\n"
+            "`/倒计时`\n"
+            "- 距离星布谷地开服还有多久\n\n"
 #            "`/菜详情 菜名`(可模糊搜索)\n"
 #            "- 返回这道菜具体信息\n"
             "`/许愿 许愿内容`\n"
