@@ -264,10 +264,10 @@ def build_countdown_text(now: datetime | None = None) -> str:
         hours, rem = divmod(left, 3600)
         minutes, seconds = divmod(rem, 60)
         return f"**距离星布谷地开服还有**\n**{hours}**小时**{minutes}**分**{seconds}**秒"
-    return f"**距离星布谷地开服还有**\n**{left // COUNTDOWN_SECONDS_PER_DAY}**天"
+    return f"**距离星布谷地开服还有**\n**{left // COUNTDOWN_SECONDS_PER_DAY + 1}**天"
 
 
-@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.1")
+@register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0 beta2")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
