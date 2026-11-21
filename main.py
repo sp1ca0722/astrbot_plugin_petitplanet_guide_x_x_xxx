@@ -109,6 +109,11 @@ CARD_CMD_PREFIX = re.compile(
 SERVER_OPEN_AT = datetime(2026, 12, 4, 10, 0, tzinfo=timezone(timedelta(hours=8)))
 # 提示还剩不到一天时精确到时分秒，否则只报天数
 COUNTDOWN_SECONDS_PER_DAY = 24 * 60 * 60
+# 剩余不足 3 小时时，额外提示一句可能提前开服
+COUNTDOWN_SECONDS_BEFORE_HINT = 3 * 60 * 60
+# 倒计时配图（表情包）：放在 assets/countdown 下，每次随机抽一张
+COUNTDOWN_IMAGE_DIR = os.path.join(PLUGIN_DIR, "assets", "countdown")
+COUNTDOWN_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 # 平台模式（_conf_schema.json 里的 platform_mode）：只有 QQ 官方机器人渲染 Markdown
 MODE_QQ_OFFICIAL = "qq_official"
@@ -255,16 +260,23 @@ def strip_markdown(text: str) -> str:
 
 
 def build_countdown_text(now: datetime | None = None) -> str:
-    """生成开服倒计时文案：不足 24 小时精确到时分秒，否则只报天数。"""
+    """生成开服倒计时文案：不足 24 小时精确到时分秒，否则只报天数。
+
+    开服后改为「已经开服：N 天」，天数同样含当天（开服当天算第 1 天）。
+    """
     now = now or datetime.now(SERVER_OPEN_AT.tzinfo)
     left = int((SERVER_OPEN_AT - now).total_seconds())
     if left <= 0:
-        return "**星布谷地已经开服啦**"
+        return f"星布谷地已经开服：{-left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
     if left < COUNTDOWN_SECONDS_PER_DAY:
         hours, rem = divmod(left, 3600)
         minutes, seconds = divmod(rem, 60)
-        return f"**距离星布谷地开服还有**\n**{hours}**小时**{minutes}**分**{seconds}**秒"
-    return f"**距离星布谷地开服还有**\n**{left // COUNTDOWN_SECONDS_PER_DAY + 1}**天"
+        text = f"距离星布谷地开服还有\n{hours}小时{minutes}分{seconds}秒"
+        # 剩余不足 3 小时时，多提醒一句可能提前开服
+        if left < COUNTDOWN_SECONDS_BEFORE_HINT:
+            text += "\n可能会提前开服哦~"
+        return text
+    return f"距离星布谷地开服还有\n{left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
 
 
 @register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0 beta2")
@@ -472,8 +484,35 @@ class MyPlugin(Star):
 
     @filter.command("countdown", alias={'倒计时'})
     async def countdown(self, event: AstrMessageEvent):
-        """开服倒计时：/倒计时"""
-        yield event.plain_result(self._render(build_countdown_text()))
+        """开服倒计时：/倒计时（文字 + 一张随机表情包）"""
+        # 不走 markdown 富文本：带图片的消息本来就会被平台剥掉 markdown 字段，
+        # 直接用「纯文字 + 富媒体图片」，图片排在文字下方。
+        parts: list = [Plain(build_countdown_text())]
+        image_path = self._pick_countdown_image()
+        if image_path:
+            parts.append(Image.fromFileSystem(image_path))
+        try:
+            await event.send(MessageChain(parts))
+        except Exception as e:
+            logger.error(f"发送倒计时失败：{e}")
+        event.stop_event()
+        yield
+
+    def _pick_countdown_image(self) -> str | None:
+        """从 assets/countdown 里随机抽一张配图；目录缺失或为空时返回 None。"""
+        try:
+            names = [
+                name
+                for name in os.listdir(COUNTDOWN_IMAGE_DIR)
+                if name.lower().endswith(COUNTDOWN_IMAGE_EXTS)
+            ]
+        except OSError as e:
+            logger.warning(f"读取倒计时配图目录失败（{COUNTDOWN_IMAGE_DIR}）：{e}")
+            return None
+        if not names:
+            logger.warning(f"倒计时配图目录里没有图片：{COUNTDOWN_IMAGE_DIR}")
+            return None
+        return os.path.join(COUNTDOWN_IMAGE_DIR, random.choice(names))
 
     @filter.command("imagetest", alias={'图片测试'})
     async def imagetest(self, event: AstrMessageEvent):
@@ -1106,7 +1145,7 @@ class MyPlugin(Star):
             "`/卡片 菜名`(可模糊搜索)\n"
             "- 把这道菜渲染成图片卡片\n\n"
             "`/倒计时`\n"
-            "- 距离星布谷地开服还有多久\n\n"
+            "- 距离星布谷地开服还有多久（附一张表情包）\n\n"
 #            "`/菜详情 菜名`(可模糊搜索)\n"
 #            "- 返回这道菜具体信息\n"
             "`/许愿 许愿内容`\n"
