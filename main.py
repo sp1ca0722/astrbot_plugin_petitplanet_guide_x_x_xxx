@@ -267,16 +267,16 @@ def build_countdown_text(now: datetime | None = None) -> str:
     now = now or datetime.now(SERVER_OPEN_AT.tzinfo)
     left = int((SERVER_OPEN_AT - now).total_seconds())
     if left <= 0:
-        return f"星布谷地已经开服：{-left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
+        return f"\n星布谷地已经开服：{-left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
     if left < COUNTDOWN_SECONDS_PER_DAY:
         hours, rem = divmod(left, 3600)
         minutes, seconds = divmod(rem, 60)
-        text = f"距离星布谷地开服还有\n{hours}小时{minutes}分{seconds}秒"
+        text = f"\n距离星布谷地开服还有\n{hours}小时{minutes}分{seconds}秒"
         # 剩余不足 3 小时时，多提醒一句可能提前开服
         if left < COUNTDOWN_SECONDS_BEFORE_HINT:
             text += "\n可能会提前开服哦~"
         return text
-    return f"距离星布谷地开服还有\n{left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
+    return f"\n距离星布谷地开服还有\n{left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
 
 
 @register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0 beta2")
