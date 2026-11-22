@@ -110,9 +110,9 @@ SERVER_OPEN_AT = datetime(2026, 12, 4, 10, 0, tzinfo=timezone(timedelta(hours=8)
 COUNTDOWN_SECONDS_PER_DAY = 24 * 60 * 60
 # 剩余不足 3 小时时，额外提示一句可能提前开服
 COUNTDOWN_SECONDS_BEFORE_HINT = 3 * 60 * 60
-# 倒计时配图（表情包）：放在 assets/countdown 下，每次随机抽一张
+# 倒计时配图（GIF 表情包）：放在 assets/countdown 下，每次随机抽一张
 COUNTDOWN_IMAGE_DIR = os.path.join(PLUGIN_DIR, "assets", "countdown")
-COUNTDOWN_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+COUNTDOWN_IMAGE_EXTS = (".gif",)
 
 # 平台模式（_conf_schema.json 里的 platform_mode）：只有 QQ 官方机器人渲染 Markdown
 MODE_QQ_OFFICIAL = "qq_official"
@@ -466,7 +466,7 @@ class MyPlugin(Star):
 
     @filter.command("countdown", alias={'倒计时'})
     async def countdown(self, event: AstrMessageEvent):
-        """开服倒计时：/倒计时（文字 + 一张随机表情包）"""
+        """开服倒计时：/倒计时（文字 + 一张随机 GIF 表情包）"""
         # 不走 markdown 富文本：带图片的消息本来就会被平台剥掉 markdown 字段，
         # 直接用「纯文字 + 富媒体图片」，图片排在文字下方。
         parts: list = [Plain(build_countdown_text())]
@@ -481,7 +481,7 @@ class MyPlugin(Star):
         yield
 
     def _pick_countdown_image(self) -> str | None:
-        """从 assets/countdown 里随机抽一张配图；目录缺失或为空时返回 None。"""
+        """从 assets/countdown 里随机抽一张 GIF 配图；目录缺失或为空时返回 None。"""
         try:
             names = [
                 name
@@ -1075,7 +1075,7 @@ class MyPlugin(Star):
             "`/卡片 菜名`(可模糊搜索)\n"
             "- 把这道菜渲染成图片卡片\n\n"
             "`/倒计时`\n"
-            "- 距离星布谷地开服还有多久（附一张表情包）\n\n"
+            "- 距离星布谷地开服还有多久\n\n"
 #            "`/菜详情 菜名`(可模糊搜索)\n"
 #            "- 返回这道菜具体信息\n"
             "`/许愿 许愿内容`\n"
