@@ -239,14 +239,17 @@ def strip_markdown(text: str) -> str:
 
 
 def build_countdown_text(now: datetime | None = None) -> str:
-    """生成开服倒计时文案：不足 24 小时精确到时分秒，否则只报天数。
+    """生成开服倒计时文案：剩余 24 小时以上按日期差算天数，不足 24 小时精确到时分秒。
 
-    开服后改为「已经开服：N 天」，天数同样含当天（开服当天算第 1 天）。
+    天数用「开服日期 - 今天日期」，所以 12/3 查就是「还有 1 天」；
+    不能按 24 小时整除向上取整，那样 12/3 会算成「2 天」。
+    开服后改为「恭喜星布谷地开服：N 天」，开服当天算第 1 天。
     """
     now = now or datetime.now(SERVER_OPEN_AT.tzinfo)
     left = int((SERVER_OPEN_AT - now).total_seconds())
     if left <= 0:
-        return f"\n恭喜星布谷地开服：{-left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
+        days = (now.date() - SERVER_OPEN_AT.date()).days + 1
+        return f"\n恭喜星布谷地开服：{days}天"
     if left < COUNTDOWN_SECONDS_PER_DAY:
         hours, rem = divmod(left, 3600)
         minutes, seconds = divmod(rem, 60)
@@ -255,7 +258,7 @@ def build_countdown_text(now: datetime | None = None) -> str:
         if left < COUNTDOWN_SECONDS_BEFORE_HINT:
             text += "\n可能会提前开服哦~"
         return text
-    return f"\n距离星布谷地开服还有\n{left // COUNTDOWN_SECONDS_PER_DAY + 1}天"
+    return f"\n距离星布谷地开服还有\n{(SERVER_OPEN_AT.date() - now.date()).days}天"
 
 
 @register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0 beta2")
