@@ -104,12 +104,34 @@ CARD_CMD_PREFIX = re.compile(
     r"^\s*/?\s*(?:card|菜谱卡片|卡片)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
 )
 
+# 开服倒计时指令前缀，剥掉 “/倒计时”“/countdown” 这类头，剩下的就是可选参数
+COUNTDOWN_CMD_PREFIX = re.compile(
+    r"^\s*/?\s*(?:countdown|倒计时)(?![A-Za-z0-9_])[\s:：]*", re.IGNORECASE
+)
+# 「详细」参数的各种写法：/倒计时 详细、/countdown detail、/倒计时 精确
+COUNTDOWN_DETAIL_FLAGS = {
+    "详细",
+    "详情",
+    "详细模式",
+    "精确",
+    "精确到秒",
+    "到秒",
+    "秒",
+    "detail",
+    "details",
+    "d",
+}
+
 # 开服倒计时：固定按北京时间（UTC+8）算，不依赖服务器时区（容器里常是 UTC）
 SERVER_OPEN_AT = datetime(2026, 12, 4, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+# 预下载开启时间：12/1 10:00，同样按北京时间
+PREDOWNLOAD_AT = datetime(2026, 12, 1, 10, 0, tzinfo=timezone(timedelta(hours=8)))
 # 提示还剩不到一天时精确到时分秒，否则只报天数
 COUNTDOWN_SECONDS_PER_DAY = 24 * 60 * 60
 # 剩余不足 3 小时时，额外提示一句可能提前开服
 COUNTDOWN_SECONDS_BEFORE_HINT = 3 * 60 * 60
+# 显示预下载提示的截止时间：开服前 3 小时（也就是提醒可能提前开服的时间点）
+PREDOWNLOAD_SHOW_UNTIL = SERVER_OPEN_AT - timedelta(seconds=COUNTDOWN_SECONDS_BEFORE_HINT)
 # 倒计时配图（GIF 表情包）：放在 assets/countdown 下，每次随机抽一张
 COUNTDOWN_IMAGE_DIR = os.path.join(PLUGIN_DIR, "assets", "countdown")
 COUNTDOWN_IMAGE_EXTS = (".gif",)
@@ -238,11 +260,50 @@ def strip_markdown(text: str) -> str:
     return text
 
 
-def build_countdown_text(now: datetime | None = None) -> str:
-    """生成开服倒计时文案：剩余 24 小时以上按日期差算天数，不足 24 小时精确到时分秒。
+def is_detailed_arg(arg) -> bool:
+    """倒计时的可选参数是不是「详细」：认中英文若干写法，别的参数一律当没写。"""
+    return squash(arg).lower() in COUNTDOWN_DETAIL_FLAGS
 
-    天数用「开服日期 - 今天日期」，所以 12/3 查就是「还有 1 天」；
+
+def format_remaining_span(
+    left: int, now: datetime, target: datetime, detailed: bool = False
+) -> str:
+    """把剩余秒数格式化成「X天Y小时Z分W秒」。
+
+    默认：剩余 24 小时以上只报天数，不足 24 小时精确到时分秒。
+    detailed=True（`/倒计时 详细`）：一律精确到秒，剩余超过 1 天时也带上天数。
+    天数用「目标日期 - 今天日期」，所以 12/3 查 12/4 就是「还有 1 天」；
     不能按 24 小时整除向上取整，那样 12/3 会算成「2 天」。
+    """
+    if not detailed and left >= COUNTDOWN_SECONDS_PER_DAY:
+        return f"{(target.date() - now.date()).days}天"
+    days, rem = divmod(left, COUNTDOWN_SECONDS_PER_DAY)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    # 不足 1 天时不写「0天」，读起来更顺
+    span = f"{days}天" if days else ""
+    return span + f"{hours}小时{minutes}分{seconds}秒"
+
+
+def build_predownload_text(now: datetime) -> str:
+    """生成预下载提示，放到开服倒计时的下一行。
+
+    只报剩余天数（不显示时分秒），当天还没开启时写「今天」；
+    开启后只说一句「预下载已经开启！」（不统计已开启多久）；
+    到开服前 3 小时（提醒可能提前开服的时间点）就不再显示。
+    """
+    if now >= PREDOWNLOAD_SHOW_UNTIL:
+        return ""
+    if now >= PREDOWNLOAD_AT:
+        return "\n预下载已经开启！"
+    days = (PREDOWNLOAD_AT.date() - now.date()).days
+    span = f"{days}天" if days else "今天"
+    return f"\n距离预下载还有\n{span}"
+
+
+def build_countdown_text(now: datetime | None = None, detailed: bool = False) -> str:
+    """生成开服倒计时文案（下一行附带预下载提示）。
+
     开服后改为「恭喜星布谷地开服：N 天」，开服当天算第 1 天。
     """
     now = now or datetime.now(SERVER_OPEN_AT.tzinfo)
@@ -250,15 +311,12 @@ def build_countdown_text(now: datetime | None = None) -> str:
     if left <= 0:
         days = (now.date() - SERVER_OPEN_AT.date()).days + 1
         return f"\n恭喜星布谷地开服：{days}天"
-    if left < COUNTDOWN_SECONDS_PER_DAY:
-        hours, rem = divmod(left, 3600)
-        minutes, seconds = divmod(rem, 60)
-        text = f"\n距离星布谷地开服还有\n{hours}小时{minutes}分{seconds}秒"
-        # 剩余不足 3 小时时，多提醒一句可能提前开服
-        if left < COUNTDOWN_SECONDS_BEFORE_HINT:
-            text += "\n可能会提前开服哦~"
-        return text
-    return f"\n距离星布谷地开服还有\n{(SERVER_OPEN_AT.date() - now.date()).days}天"
+    span = format_remaining_span(left, now, SERVER_OPEN_AT, detailed)
+    text = f"\n距离星布谷地开服还有\n{span}"
+    # 剩余不足 3 小时时，多提醒一句可能提前开服
+    if left < COUNTDOWN_SECONDS_BEFORE_HINT:
+        text += "\n可能会提前开服哦~"
+    return text + build_predownload_text(now)
 
 
 @register("astrbot_plugin_petitplanet_guide_x_x_xxx", "spica", "星布谷地漫游指北", "1.2.0 beta2")
@@ -466,10 +524,12 @@ class MyPlugin(Star):
 
     @filter.command("countdown", alias={'倒计时'})
     async def countdown(self, event: AstrMessageEvent):
-        """开服倒计时：/倒计时（文字 + 一张随机 GIF 表情包）"""
+        """开服倒计时：/倒计时（文字 + 一张随机 GIF 表情包）；/倒计时 详细 精确到秒"""
+        # 可选参数「详细」：剥掉指令头后，认中英文若干写法，其它参数当没写
+        arg = COUNTDOWN_CMD_PREFIX.sub("", event.message_str).strip()
         # 不走 markdown 富文本：带图片的消息本来就会被平台剥掉 markdown 字段，
         # 直接用「纯文字 + 富媒体图片」，图片排在文字下方。
-        parts: list = [Plain(build_countdown_text())]
+        parts: list = [Plain(build_countdown_text(detailed=is_detailed_arg(arg)))]
         image_path = self._pick_countdown_image()
         if image_path:
             parts.append(Image.fromFileSystem(image_path))
@@ -1075,7 +1135,9 @@ class MyPlugin(Star):
             "`/卡片 菜名`(可模糊搜索)\n"
             "- 把这道菜渲染成图片卡片\n\n"
             "`/倒计时`\n"
-            "- 距离星布谷地开服还有多久\n\n"
+            "- 距离星布谷地开服/预下载还有多久\n\n"
+            "`/倒计时 详细`\n"
+            "- 同上，精确到秒\n\n"
 #            "`/菜详情 菜名`(可模糊搜索)\n"
 #            "- 返回这道菜具体信息\n"
             "`/许愿 许愿内容`\n"
